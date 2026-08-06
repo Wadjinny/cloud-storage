@@ -47,9 +47,18 @@ def wait_job(client: httpx.Client, job_id: str, *, timeout: float = 3600) -> dic
 
 def main() -> int:
     load_dotenv(Path(__file__).resolve().parents[1] / ".env")
-    passphrase = os.environ.get("CLOUD_STORAGE_VAULT_PASSPHRASE", "").strip().strip("'\"")
-    if not passphrase:
-        print("CLOUD_STORAGE_VAULT_PASSPHRASE missing in .env", file=sys.stderr)
+    username = (
+        os.environ.get("INIT_USERNAME")
+        or os.environ.get("CLOUD_STORAGE_USERNAME")
+        or ""
+    ).strip().strip("'\"")
+    passphrase = (
+        os.environ.get("INIT_PASSPHRASE")
+        or os.environ.get("CLOUD_STORAGE_VAULT_PASSPHRASE")
+        or ""
+    ).strip().strip("'\"")
+    if not username or not passphrase:
+        print("INIT_USERNAME / INIT_PASSPHRASE missing in .env", file=sys.stderr)
         return 2
 
     parser = argparse.ArgumentParser()
@@ -69,9 +78,12 @@ def main() -> int:
 
     # timeout=None disables all timeouts (needed for large MEGA/Drive transfers).
     with httpx.Client(base_url=BACKEND, timeout=None, follow_redirects=False) as client:
-        unlock = client.post("/api/vault/unlock", json={"passphrase": passphrase})
+        unlock = client.post(
+            "/api/auth/login",
+            json={"username": username, "passphrase": passphrase},
+        )
         if unlock.status_code != 200:
-            print(f"unlock failed: {unlock.status_code} {unlock.text}", file=sys.stderr)
+            print(f"login failed: {unlock.status_code} {unlock.text}", file=sys.stderr)
             return 1
         print("vault unlocked", flush=True)
 

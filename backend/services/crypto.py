@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
+from typing import Any
 
 from argon2.low_level import Type, hash_secret_raw
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -86,3 +88,18 @@ def unwrap_file_key(master_key: bytes, wrapped: str) -> bytes:
     raw = b64d(wrapped)
     nonce, ciphertext = raw[:NONCE_LEN], raw[NONCE_LEN:]
     return decrypt(master_key, ciphertext, nonce)
+
+
+def seal_json(key: bytes, obj: Any) -> str:
+    """Encrypt a JSON-serializable object; returns urlsafe-b64(nonce||ciphertext)."""
+    plaintext = json.dumps(obj, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ciphertext, nonce = encrypt(key, plaintext)
+    return b64e(nonce + ciphertext)
+
+
+def open_json(key: bytes, sealed: str) -> Any:
+    """Decrypt a blob produced by seal_json."""
+    raw = b64d(sealed)
+    nonce, ciphertext = raw[:NONCE_LEN], raw[NONCE_LEN:]
+    plaintext = decrypt(key, ciphertext, nonce)
+    return json.loads(plaintext.decode("utf-8"))

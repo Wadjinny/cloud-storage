@@ -13,6 +13,7 @@ from typing import Any
 from config import SHARD_UPLOAD_CONCURRENCY, UPLOAD_QUEUE_DEPTH, choose_chunk_size
 from services import vault as vault_service
 from services.jobs import jobs
+from storage import auth_context
 from storage import upload_sessions
 
 _SENTINEL = object()
@@ -31,6 +32,7 @@ def _live_shard_slots() -> int:
 @dataclass
 class UploadPipeline:
     job_id: str
+    user_id: str
     master_key: bytes
     path: str
     filename: str
@@ -60,6 +62,7 @@ class UploadPipelineHub:
         self,
         *,
         job_id: str,
+        user_id: str,
         master_key: bytes,
         path: str,
         filename: str,
@@ -72,6 +75,7 @@ class UploadPipelineHub:
         sid = session_id or f"f_{secrets.token_hex(8)}"
         pipeline = UploadPipeline(
             job_id=job_id,
+            user_id=user_id,
             master_key=master_key,
             path=path,
             filename=filename,
@@ -145,6 +149,10 @@ class UploadPipelineHub:
             yield item
 
     def _worker(self, pipeline: UploadPipeline) -> None:
+        with auth_context.auth_scope(pipeline.user_id, pipeline.master_key):
+            self._worker_inner(pipeline)
+
+    def _worker_inner(self, pipeline: UploadPipeline) -> None:
         def on_progress(
             phase: str,
             current: int,

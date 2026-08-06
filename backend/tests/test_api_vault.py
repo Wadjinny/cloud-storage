@@ -3,9 +3,8 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 from providers.memory import MemoryProvider
-from tests.conftest import TEST_CHUNK_SIZE, TEST_PASSPHRASE
+from tests.conftest import TEST_CHUNK_SIZE, TEST_PASSPHRASE, TEST_USERNAME
 from tests.helpers import download_bytes, upload_bytes, wait_job
-
 
 
 def test_health(client: TestClient) -> None:
@@ -19,41 +18,65 @@ def test_locked_endpoints_return_401(client: TestClient) -> None:
     assert client.post("/api/vault/upload/start", json={"filename": "x"}).status_code == 401
     assert client.post("/api/vault/download", params={"id": "f_x"}).status_code == 401
     assert client.delete("/api/vault/files/f_x").status_code == 401
+    assert client.get("/api/accounts").status_code == 401
 
 
-def test_unlock_lock_status(client: TestClient) -> None:
+def test_login_logout_status(client: TestClient) -> None:
     status = client.get("/api/vault/status")
     assert status.status_code == 200
     body = status.json()
     assert body["unlocked"] is False
-    assert body["initialized"] is False
-    assert body["account_count"] == 1
+    assert body["initialized"] is True
+    assert body["account_count"] == 0
 
-    # First unlock initializes the vault with this passphrase.
-    ok = client.post("/api/vault/unlock", json={"passphrase": TEST_PASSPHRASE})
+    ok = client.post(
+        "/api/auth/login",
+        json={"username": TEST_USERNAME, "passphrase": TEST_PASSPHRASE},
+    )
     assert ok.status_code == 200
+    assert ok.json()["username"] == TEST_USERNAME
 
-    locked = client.post("/api/vault/lock")
+    locked = client.post("/api/auth/logout")
     assert locked.status_code == 200
     assert client.get("/api/vault/files").status_code == 401
 
-    bad = client.post("/api/vault/unlock", json={"passphrase": "wrong"})
+    bad = client.post(
+        "/api/auth/login",
+        json={"username": TEST_USERNAME, "passphrase": "wrong"},
+    )
     assert bad.status_code == 401
 
-    again = client.post("/api/vault/unlock", json={"passphrase": TEST_PASSPHRASE})
+    again = client.post(
+        "/api/auth/login",
+        json={"username": TEST_USERNAME, "passphrase": TEST_PASSPHRASE},
+    )
     assert again.status_code == 200
     status = client.get("/api/vault/status").json()
     assert status["unlocked"] is True
     assert status["initialized"] is True
+    assert status["username"] == TEST_USERNAME
+    assert status["account_count"] == 1
 
 
 def test_upload_requires_account(data_dir, small_chunks) -> None:
     from main import app
     from storage import accounts as accounts_store
+    from storage import auth_context
+    from services import crypto
+    from storage import users as users_store
 
-    accounts_store.save_accounts([])
+    user = users_store.get_by_username(TEST_USERNAME)
+    assert user is not None
+    master_key = crypto.derive_master_key(TEST_PASSPHRASE, crypto.b64d(user["kdf_salt"]))
+    with auth_context.auth_scope(user["id"], master_key):
+        for account in accounts_store.load_accounts():
+            accounts_store.delete_account(account["id"])
+
     with TestClient(app) as client:
-        client.post("/api/vault/unlock", json={"passphrase": TEST_PASSPHRASE})
+        client.post(
+            "/api/auth/login",
+            json={"username": TEST_USERNAME, "passphrase": TEST_PASSPHRASE},
+        )
         resp = client.post(
             "/api/vault/upload/start",
             json={"filename": "x.bin", "size": 1},

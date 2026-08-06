@@ -22,7 +22,7 @@ from collections.abc import Iterator
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.conftest import TEST_PASSPHRASE
+from tests.conftest import TEST_PASSPHRASE, TEST_USERNAME
 from tests.helpers import download_bytes, upload_bytes, wait_job
 
 pytestmark = pytest.mark.live
@@ -60,8 +60,11 @@ def live_client(live_data_dir) -> Iterator[TestClient]:
     download_sessions._sessions.clear()
 
     with TestClient(app) as client:
-        unlock = client.post("/api/vault/unlock", json={"passphrase": TEST_PASSPHRASE})
-        assert unlock.status_code == 200, unlock.text
+        login = client.post(
+            "/api/auth/login",
+            json={"username": TEST_USERNAME, "passphrase": TEST_PASSPHRASE},
+        )
+        assert login.status_code == 200, login.text
         yield client
 
 
@@ -88,7 +91,10 @@ def _roundtrip(client: TestClient, provider: str) -> None:
     reason="Set CLOUD_STORAGE_TEST_MEGA_EMAIL and CLOUD_STORAGE_TEST_MEGA_PASSWORD",
 )
 def test_mega_upload_download_delete(live_client: TestClient) -> None:
+    from services import crypto
     from storage import accounts as accounts_store
+    from storage import auth_context
+    from storage import users as users_store
 
     email = _env("CLOUD_STORAGE_TEST_MEGA_EMAIL")
     password = _env("CLOUD_STORAGE_TEST_MEGA_PASSWORD")
@@ -97,7 +103,11 @@ def test_mega_upload_download_delete(live_client: TestClient) -> None:
     mfa = _env("CLOUD_STORAGE_TEST_MEGA_MFA")
     if mfa:
         credentials["mfa"] = mfa
-    accounts_store.add_account(provider="mega", label=email, credentials=credentials)
+    user = users_store.get_by_username(TEST_USERNAME)
+    assert user is not None
+    master_key = crypto.derive_master_key(TEST_PASSPHRASE, crypto.b64d(user["kdf_salt"]))
+    with auth_context.auth_scope(user["id"], master_key):
+        accounts_store.add_account(provider="mega", label=email, credentials=credentials)
     _roundtrip(live_client, "mega")
 
 
@@ -107,7 +117,10 @@ def test_mega_upload_download_delete(live_client: TestClient) -> None:
 )
 def test_gdrive_upload_download_delete(live_client: TestClient) -> None:
     from config import google_configured
+    from services import crypto
     from storage import accounts as accounts_store
+    from storage import auth_context
+    from storage import users as users_store
 
     if not google_configured():
         pytest.skip("GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET not configured")
@@ -119,5 +132,9 @@ def test_gdrive_upload_download_delete(live_client: TestClient) -> None:
         "token": _env("CLOUD_STORAGE_TEST_GDRIVE_TOKEN"),
     }
     label = _env("CLOUD_STORAGE_TEST_GDRIVE_LABEL") or "test-gdrive"
-    accounts_store.add_account(provider="gdrive", label=label, credentials=credentials)
+    user = users_store.get_by_username(TEST_USERNAME)
+    assert user is not None
+    master_key = crypto.derive_master_key(TEST_PASSPHRASE, crypto.b64d(user["kdf_salt"]))
+    with auth_context.auth_scope(user["id"], master_key):
+        accounts_store.add_account(provider="gdrive", label=label, credentials=credentials)
     _roundtrip(live_client, "gdrive")

@@ -28,6 +28,7 @@ from providers.factory import get_provider
 from services import crypto
 from services.capacity import PlacementPlanner, cipher_size
 from storage import accounts as accounts_store
+from storage import auth_context
 from storage import upload_sessions
 from storage import vault_index
 
@@ -83,24 +84,6 @@ def discard_upload_session(session_id: str) -> None:
                 account_id,
             )
     upload_sessions.delete(session_id)
-
-
-def unlock(passphrase: str) -> bytes:
-    index = vault_index.load_index()
-    if index.get("kdf_salt") is None:
-        salt = crypto.new_salt()
-        master_key = crypto.derive_master_key(passphrase, salt)
-        index["kdf_salt"] = crypto.b64e(salt)
-        index["verifier"] = crypto.make_verifier(master_key)
-        index.setdefault("files", [])
-        vault_index.save_index(index)
-        return master_key
-
-    salt = crypto.b64d(index["kdf_salt"])
-    master_key = crypto.derive_master_key(passphrase, salt)
-    if not crypto.check_verifier(master_key, index["verifier"]):
-        raise ValueError("Invalid passphrase")
-    return master_key
 
 
 def list_entries(path: str = "/") -> list[dict[str, Any]]:
@@ -299,6 +282,9 @@ def upload_file(
     if not account_list:
         raise ValueError("Connect at least one account before uploading")
 
+    # Capture for worker threads (ThreadPoolExecutor does not inherit contextvars).
+    user_id = auth_context.require_user_id()
+
     planner = PlacementPlanner.from_accounts(account_list)
     providers_by_id = _providers_by_id(account_list)
 
@@ -315,6 +301,7 @@ def upload_file(
         filename = existing.get("filename") or filename
         shard_records = {int(s["i"]): s for s in existing.get("shards", [])}
         remote_folders = dict(existing.get("remote_folders") or {})
+        existing["user_id"] = user_id
         existing["status"] = "active"
         existing["error"] = None
         upload_sessions.save(existing)
@@ -327,6 +314,7 @@ def upload_file(
             {
                 "version": 1,
                 "id": file_id,
+                "user_id": user_id,
                 "status": "active",
                 "path": _normalize_dir(dir_path),
                 "filename": filename,
@@ -389,6 +377,7 @@ def upload_file(
             session = {
                 "version": 1,
                 "id": file_id,
+                "user_id": user_id,
                 "status": status or "active",
                 "path": _normalize_dir(dir_path),
                 "filename": filename,

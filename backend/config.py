@@ -7,11 +7,11 @@ _BACKEND_DIR = Path(__file__).resolve().parent
 load_dotenv(_BACKEND_DIR / ".env")
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", _BACKEND_DIR / "data"))
-ACCOUNTS_PATH = DATA_DIR / "accounts.json"
-VAULT_INDEX_PATH = DATA_DIR / "vault" / "index.json"
-UPLOAD_SESSIONS_DIR = DATA_DIR / "vault" / "uploads"
+DB_PATH = Path(os.environ.get("DB_PATH", DATA_DIR / "app.db"))
 
 SESSION_SECRET = os.environ.get("SESSION_SECRET", "dev-session-secret-change-me")
+INIT_USERNAME = os.environ.get("INIT_USERNAME", "")
+INIT_PASSPHRASE = os.environ.get("INIT_PASSPHRASE", "")
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 GOOGLE_CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:5173")

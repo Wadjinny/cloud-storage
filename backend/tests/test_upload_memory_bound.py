@@ -8,7 +8,7 @@ import time
 import pytest
 from fastapi.testclient import TestClient
 
-from tests.conftest import TEST_PASSPHRASE
+from tests.conftest import TEST_PASSPHRASE, TEST_USERNAME
 from tests.payload import iter_pattern_bytes
 
 
@@ -39,7 +39,11 @@ def bounded_client(data_dir, real_chunks, memory_account, monkeypatch: pytest.Mo
     download_sessions._sessions.clear()
 
     with TestClient(app) as client:
-        assert client.post("/api/vault/unlock", json={"passphrase": TEST_PASSPHRASE}).status_code == 200
+        login = client.post(
+            "/api/auth/login",
+            json={"username": TEST_USERNAME, "passphrase": TEST_PASSPHRASE},
+        )
+        assert login.status_code == 200, login.text
         yield client
 
 

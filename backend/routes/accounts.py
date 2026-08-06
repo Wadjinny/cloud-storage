@@ -3,18 +3,21 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from config import STORAGE_FULL_RATIO
+from deps import require_unlocked
 from providers.factory import get_provider
 from services.capacity import headroom_bytes, is_full
 from storage import accounts as accounts_store
+from storage import auth_context
 
 router = APIRouter(prefix="/api/accounts", tags=["accounts"])
 
 
 @router.get("")
-def list_accounts() -> list[dict[str, str]]:
+def list_accounts(request: Request) -> list[dict[str, str]]:
+    require_unlocked(request)
     return accounts_store.list_public()
 
 
@@ -46,12 +49,19 @@ def _quota_for_account(account: dict[str, Any]) -> dict[str, Any]:
 
 
 @router.get("/storage")
-def list_storage() -> dict[str, Any]:
+def list_storage(request: Request) -> dict[str, Any]:
+    master_key = require_unlocked(request)
+    user_id = auth_context.require_user_id()
     accounts = accounts_store.load_accounts()
     rows: list[dict[str, Any]] = []
     if accounts:
+        # Provider quota calls may refresh Drive tokens on worker threads.
+        def _quota(account: dict[str, Any]) -> dict[str, Any]:
+            with auth_context.auth_scope(user_id, master_key):
+                return _quota_for_account(account)
+
         with ThreadPoolExecutor(max_workers=min(8, len(accounts))) as pool:
-            futures = {pool.submit(_quota_for_account, account): account["id"] for account in accounts}
+            futures = {pool.submit(_quota, account): account["id"] for account in accounts}
             by_id: dict[str, dict[str, Any]] = {}
             for fut in as_completed(futures):
                 by_id[futures[fut]] = fut.result()
@@ -94,7 +104,8 @@ def list_storage() -> dict[str, Any]:
 
 
 @router.delete("/{account_id}")
-def delete_account(account_id: str) -> dict[str, bool]:
+def delete_account(request: Request, account_id: str) -> dict[str, bool]:
+    require_unlocked(request)
     account = accounts_store.get_account(account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")

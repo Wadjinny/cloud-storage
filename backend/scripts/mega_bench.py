@@ -36,6 +36,7 @@ load_dotenv(_BACKEND / ".env")
 os.environ.setdefault("SESSION_SECRET", "mega-bench-session")
 
 BENCH_FOLDER = "cloud-storage-vault-bench"
+BENCH_USERNAME = "mega-bench"
 PASSPHRASE = "mega-bench-passphrase"
 
 
@@ -149,21 +150,18 @@ def _apply_config(cfg: TrialConfig) -> None:
 
 def _setup_data_dir(root: Path) -> None:
     import config
-    from storage import accounts as accounts_store
-    from storage import vault_index
+    from storage.db import init_db, reset_for_tests
+    from storage.users import create_user, get_by_username
 
-    accounts = root / "accounts.json"
-    index = root / "vault" / "index.json"
-    index.parent.mkdir(parents=True, exist_ok=True)
-
+    db_path = root / "app.db"
     os.environ["DATA_DIR"] = str(root)
+    os.environ["DB_PATH"] = str(db_path)
     config.DATA_DIR = root
-    config.ACCOUNTS_PATH = accounts
-    config.VAULT_INDEX_PATH = index
-    accounts_store.DATA_DIR = root
-    accounts_store.ACCOUNTS_PATH = accounts
-    vault_index.DATA_DIR = root
-    vault_index.VAULT_INDEX_PATH = index
+    config.DB_PATH = db_path
+    reset_for_tests()
+    init_db(db_path)
+    if get_by_username(BENCH_USERNAME) is None:
+        create_user(BENCH_USERNAME, PASSPHRASE)
 
 
 def _run_trial(
@@ -176,22 +174,30 @@ def _run_trial(
     mfa: str | None,
 ) -> TrialResult:
     from providers.mega_session import mega_sessions
+    from services import crypto
     from services import vault as vault_service
     from storage import accounts as accounts_store
-    from storage import vault_index
+    from storage import auth_context
+    from storage import users as users_store
+    from storage.db import init_db, reset_for_tests
+    from storage.users import create_user
 
     _apply_config(cfg)
     mega_sessions.drop(email)
 
-    accounts_store.save_accounts([])
-    vault_index.save_index(
-        {
-            "version": 1,
-            "kdf_salt": None,
-            "verifier": None,
-            "files": [],
-        }
-    )
+    # Fresh DB per trial so account/file state cannot leak across runs.
+    import config
+
+    root = Path(config.DATA_DIR)
+    db_path = root / "app.db"
+    if db_path.exists():
+        db_path.unlink()
+    reset_for_tests()
+    init_db(db_path)
+    create_user(BENCH_USERNAME, PASSPHRASE)
+    user = users_store.get_by_username(BENCH_USERNAME)
+    assert user is not None
+    master_key = crypto.derive_master_key(PASSPHRASE, crypto.b64d(user["kdf_salt"]))
 
     counter = _LogCounter()
     root_logger = logging.getLogger()
@@ -222,28 +228,28 @@ def _run_trial(
         )
 
     try:
-        master_key = vault_service.unlock(PASSPHRASE)
-        credentials = {"email": email, "password": password}
-        if mfa:
-            credentials["mfa"] = mfa
-        accounts_store.add_account(provider="mega", label=email, credentials=credentials)
+        with auth_context.auth_scope(user["id"], master_key):
+            credentials = {"email": email, "password": password}
+            if mfa:
+                credentials["mfa"] = mfa
+            accounts_store.add_account(provider="mega", label=email, credentials=credentials)
 
-        filename = f"bench-{cfg.mega_conc}-{cfg.shard_conc}-{cfg.chunk_mib}-{uuid.uuid4().hex[:8]}.bin"
-        entry = vault_service.upload_file(
-            master_key,
-            "/bench",
-            filename,
-            _iter_file_chunks(payload_path, cfg.chunk_size, payload_size),
-            size=payload_size,
-            chunk_size=cfg.chunk_size,
-            on_progress=on_progress,
-        )
-        shards = len(entry.get("shards") or [])
-        if entry.get("size") != payload_size:
-            raise RuntimeError(
-                f"size mismatch stored={entry.get('size')} expected={payload_size}"
+            filename = f"bench-{cfg.mega_conc}-{cfg.shard_conc}-{cfg.chunk_mib}-{uuid.uuid4().hex[:8]}.bin"
+            entry = vault_service.upload_file(
+                master_key,
+                "/bench",
+                filename,
+                _iter_file_chunks(payload_path, cfg.chunk_size, payload_size),
+                size=payload_size,
+                chunk_size=cfg.chunk_size,
+                on_progress=on_progress,
             )
-        vault_service.delete_file(entry["id"])
+            shards = len(entry.get("shards") or [])
+            if entry.get("size") != payload_size:
+                raise RuntimeError(
+                    f"size mismatch stored={entry.get('size')} expected={payload_size}"
+                )
+            vault_service.delete_file(entry["id"])
         ok = True
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"

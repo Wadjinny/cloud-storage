@@ -1,14 +1,27 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
 from config import SESSION_SECRET, cors_allow_origins
 from routes.accounts import router as accounts_router
+from routes.auth import router as auth_router
 from routes.auth_google import router as auth_google_router
 from routes.auth_mega import router as auth_mega_router
 from routes.vault import router as vault_router
+from storage.db import init_db
+from storage.users import ensure_init_user
 
-app = FastAPI(title="cloud-storage")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    init_db()
+    ensure_init_user()
+    yield
+
+
+app = FastAPI(title="cloud-storage", lifespan=lifespan)
 
 app.add_middleware(
     SessionMiddleware,
@@ -24,6 +37,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth_router)
 app.include_router(accounts_router)
 app.include_router(auth_google_router)
 app.include_router(auth_mega_router)

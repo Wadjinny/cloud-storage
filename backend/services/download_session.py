@@ -10,6 +10,7 @@ from services.jobs import jobs
 class DownloadSession:
     job_id: str
     file_id: str
+    user_id: str
     master_key: bytes
     filename: str
     size: int | None
@@ -27,6 +28,7 @@ class DownloadSessionHub:
         *,
         job_id: str,
         file_id: str,
+        user_id: str,
         master_key: bytes,
         filename: str,
         size: int | None,
@@ -34,6 +36,7 @@ class DownloadSessionHub:
         session = DownloadSession(
             job_id=job_id,
             file_id=file_id,
+            user_id=user_id,
             master_key=master_key,
             filename=filename,
             size=size,

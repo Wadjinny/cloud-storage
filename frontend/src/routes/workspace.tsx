@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from 'react'
 import { useSearchParams } from 'react-router'
 import { Group, Panel, Separator } from 'react-resizable-panels'
+import { login, logout } from '../api/auth'
 import {
   connectMega,
   deleteAccount,
@@ -17,8 +18,6 @@ import {
   getVaultFile,
   getVaultStatus,
   listVaultFiles,
-  lockVault,
-  unlockVault,
   uploadVaultFile,
   type ProgressUpdate,
   type UploadAccountStats,
@@ -234,10 +233,10 @@ export default function Workspace() {
   const [anchorId, setAnchorId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [megaOpen, setMegaOpen] = useState(false)
-  const [unlockOpen, setUnlockOpen] = useState(false)
   const [megaEmail, setMegaEmail] = useState('')
   const [megaPassword, setMegaPassword] = useState('')
   const [megaMfa, setMegaMfa] = useState('')
+  const [username, setUsername] = useState('')
   const [passphrase, setPassphrase] = useState('')
   const [transfer, setTransfer] = useState<TransferState | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -270,15 +269,23 @@ export default function Workspace() {
     setTransfer({ kind, ...mapped, ...rates })
   }
 
+  const statusQuery = useQuery({
+    queryKey: ['vault', 'status'],
+    queryFn: getVaultStatus,
+  })
+
+  const unlocked = statusQuery.data?.unlocked ?? false
+
   const accountsQuery = useQuery({
     queryKey: ['accounts'],
     queryFn: listAccounts,
+    enabled: unlocked,
   })
 
   const storageQuery = useQuery({
     queryKey: ['accounts', 'storage'],
     queryFn: getStorageStats,
-    enabled: (accountsQuery.data?.length ?? 0) > 0,
+    enabled: unlocked && (accountsQuery.data?.length ?? 0) > 0,
     staleTime: 60_000,
   })
 
@@ -287,13 +294,6 @@ export default function Workspace() {
     for (const row of storageQuery.data?.accounts ?? []) map.set(row.id, row)
     return map
   }, [storageQuery.data])
-
-  const statusQuery = useQuery({
-    queryKey: ['vault', 'status'],
-    queryFn: getVaultStatus,
-  })
-
-  const unlocked = statusQuery.data?.unlocked ?? false
 
   const filesQuery = useQuery({
     queryKey: ['vault', 'files', path],
@@ -343,22 +343,25 @@ export default function Workspace() {
 
   const crumbs = useMemo(() => pathParts(path), [path])
 
-  const unlockMut = useMutation({
-    mutationFn: unlockVault,
+  const loginMut = useMutation({
+    mutationFn: () => login(username, passphrase),
     onSuccess: async () => {
-      setUnlockOpen(false)
       setPassphrase('')
       setError(null)
       await qc.invalidateQueries({ queryKey: ['vault'] })
+      await qc.invalidateQueries({ queryKey: ['accounts'] })
     },
     onError: (e: Error) => setError(e.message),
   })
 
-  const lockMut = useMutation({
-    mutationFn: lockVault,
+  const logoutMut = useMutation({
+    mutationFn: logout,
     onSuccess: async () => {
       setError(null)
+      setSelectedIds([])
+      setPath('/')
       await qc.invalidateQueries({ queryKey: ['vault'] })
+      await qc.invalidateQueries({ queryKey: ['accounts'] })
     },
     onError: (e: Error) => setError(e.message),
   })
@@ -492,10 +495,8 @@ export default function Workspace() {
   const busy = uploadMut.isPending || downloadMut.isPending || deleteFileMut.isPending
 
   const statusText = unlocked
-    ? `unlocked · ${statusQuery.data?.file_count ?? 0} files · ${statusQuery.data?.account_count ?? 0} accounts`
-    : statusQuery.data?.initialized
-      ? 'locked'
-      : 'locked · new vault'
+    ? `${statusQuery.data?.username ?? 'user'} · ${statusQuery.data?.file_count ?? 0} files · ${statusQuery.data?.account_count ?? 0} accounts`
+    : 'locked'
 
   function openDir(entry: VaultEntry) {
     if (entry.kind !== 'dir') return
@@ -553,26 +554,80 @@ export default function Workspace() {
     })
   }
 
+  if (!unlocked) {
+    return (
+      <div className="app-shell">
+        <header className="top-bar">
+          <div className="top-bar-title">Cloud Storage</div>
+          <div className="top-bar-status">locked</div>
+        </header>
+        {error ? (
+          <div className="error-bar" role="alert">
+            {error}
+            <button type="button" className="btn" onClick={() => setError(null)}>
+              Dismiss
+            </button>
+          </div>
+        ) : null}
+        <div className="panel-body" style={{ display: 'grid', placeItems: 'center' }}>
+          <div className="modal" style={{ width: 'min(360px, 92vw)' }}>
+            <div className="modal-header">Sign in</div>
+            <div className="modal-body">
+              <div>
+                <div className="field-label">Username</div>
+                <input
+                  className="input"
+                  type="text"
+                  autoComplete="username"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  autoFocus
+                />
+              </div>
+              <div>
+                <div className="field-label">Passphrase</div>
+                <input
+                  className="input"
+                  type="password"
+                  autoComplete="current-password"
+                  value={passphrase}
+                  onChange={(e) => setPassphrase(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && username && passphrase) loginMut.mutate()
+                  }}
+                />
+              </div>
+            </div>
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="btn-primary"
+                disabled={!username || !passphrase || loginMut.isPending}
+                onClick={() => loginMut.mutate()}
+              >
+                {loginMut.isPending ? 'Signing in…' : 'Sign in'}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="app-shell">
       <header className="top-bar">
         <div className="top-bar-title">Cloud Storage</div>
         <div className="top-bar-status">{statusText}</div>
         <div className="toolbar">
-          {unlocked ? (
-            <button
-              type="button"
-              className="btn"
-              onClick={() => lockMut.mutate()}
-              disabled={lockMut.isPending}
-            >
-              Lock
-            </button>
-          ) : (
-            <button type="button" className="btn-primary" onClick={() => setUnlockOpen(true)}>
-              Unlock
-            </button>
-          )}
+          <button
+            type="button"
+            className="btn"
+            onClick={() => logoutMut.mutate()}
+            disabled={logoutMut.isPending}
+          >
+            Lock
+          </button>
         </div>
       </header>
 
@@ -1092,48 +1147,6 @@ export default function Workspace() {
         </div>
       ) : null}
 
-      {unlockOpen ? (
-        <div className="modal-backdrop" onClick={() => setUnlockOpen(false)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-header">
-              {statusQuery.data?.initialized ? 'Unlock Vault' : 'Create Vault'}
-            </div>
-            <div className="modal-body">
-              <div>
-                <div className="field-label">Passphrase</div>
-                <input
-                  className="input"
-                  type="password"
-                  value={passphrase}
-                  onChange={(e) => setPassphrase(e.target.value)}
-                  autoFocus
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && passphrase) unlockMut.mutate(passphrase)
-                  }}
-                />
-              </div>
-              {!statusQuery.data?.initialized ? (
-                <div style={{ fontSize: 11, color: 'var(--text-faint)' }}>
-                  First unlock sets the vault passphrase. It cannot be recovered if lost.
-                </div>
-              ) : null}
-            </div>
-            <div className="modal-actions">
-              <button type="button" className="btn" onClick={() => setUnlockOpen(false)}>
-                Cancel
-              </button>
-              <button
-                type="button"
-                className="btn-primary"
-                disabled={!passphrase || unlockMut.isPending}
-                onClick={() => unlockMut.mutate(passphrase)}
-              >
-                {unlockMut.isPending ? 'Unlocking…' : 'Unlock'}
-              </button>
-            </div>
-          </div>
-        </div>
-      ) : null}
     </div>
   )
 }

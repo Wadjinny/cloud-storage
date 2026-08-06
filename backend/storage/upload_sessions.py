@@ -1,17 +1,10 @@
 from __future__ import annotations
 
-import json
-import threading
 import time
 from typing import Any
 
-from config import DATA_DIR, UPLOAD_SESSIONS_DIR
-
-_lock = threading.Lock()
-
-
-def _path(session_id: str) -> Any:
-    return UPLOAD_SESSIONS_DIR / f"{session_id}.json"
+from storage import auth_context
+from storage.db import connect
 
 
 def resume_from_byte(session: dict[str, Any]) -> int:
@@ -28,30 +21,165 @@ def resume_from_byte(session: dict[str, Any]) -> int:
     return min(i * chunk_size, int(size))
 
 
+def _session_from_rows(
+    row: Any,
+    shard_rows: list[Any],
+    folder_rows: list[Any],
+) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "id": row["id"],
+        "user_id": row["user_id"],
+        "status": row["status"],
+        "path": row["path"],
+        "filename": row["filename"],
+        "size": row["size"],
+        "chunk_size": row["chunk_size"],
+        "crypto": {
+            "alg": row["crypto_alg"],
+            "wrapped_file_key": row["wrapped_file_key"],
+        },
+        "remote_folders": {
+            r["account_id"]: r["remote_folder_id"] for r in folder_rows
+        },
+        "shards": [
+            {
+                "i": r["i"],
+                "account_id": r["account_id"],
+                "remote_id": r["remote_id"],
+                "sha256": r["sha256"],
+                "nonce": r["nonce"],
+            }
+            for r in shard_rows
+        ],
+        "error": row["error"],
+        "updated_at": row["updated_at"],
+    }
+
+
 def save(session: dict[str, Any]) -> None:
-    session = dict(session)
-    session["updated_at"] = int(time.time())
-    with _lock:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        UPLOAD_SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
-        path = _path(session["id"])
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(session, indent=2), encoding="utf-8")
-        tmp.replace(path)
+    uid = session.get("user_id") or auth_context.require_user_id()
+    crypto = session.get("crypto") or {}
+    updated_at = int(time.time())
+    session["user_id"] = uid
+    session["updated_at"] = updated_at
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO upload_sessions (
+              id, user_id, status, path, filename, size, chunk_size,
+              crypto_alg, wrapped_file_key, error, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+              user_id = excluded.user_id,
+              status = excluded.status,
+              path = excluded.path,
+              filename = excluded.filename,
+              size = excluded.size,
+              chunk_size = excluded.chunk_size,
+              crypto_alg = excluded.crypto_alg,
+              wrapped_file_key = excluded.wrapped_file_key,
+              error = excluded.error,
+              updated_at = excluded.updated_at
+            """,
+            (
+                session["id"],
+                uid,
+                session.get("status") or "active",
+                session.get("path") or "/",
+                session["filename"],
+                session.get("size"),
+                int(session["chunk_size"]),
+                crypto.get("alg") or "AES-256-GCM-CHUNK",
+                crypto["wrapped_file_key"],
+                session.get("error"),
+                updated_at,
+            ),
+        )
+        conn.execute(
+            "DELETE FROM upload_session_shards WHERE session_id = ?",
+            (session["id"],),
+        )
+        conn.execute(
+            "DELETE FROM upload_session_remote_folders WHERE session_id = ?",
+            (session["id"],),
+        )
+        for shard in session.get("shards") or []:
+            conn.execute(
+                """
+                INSERT INTO upload_session_shards
+                  (session_id, i, account_id, remote_id, sha256, nonce)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session["id"],
+                    int(shard["i"]),
+                    shard["account_id"],
+                    shard["remote_id"],
+                    shard["sha256"],
+                    shard["nonce"],
+                ),
+            )
+        for account_id, remote_folder_id in (session.get("remote_folders") or {}).items():
+            conn.execute(
+                """
+                INSERT INTO upload_session_remote_folders
+                  (session_id, account_id, remote_folder_id)
+                VALUES (?, ?, ?)
+                """,
+                (session["id"], account_id, remote_folder_id),
+            )
 
 
-def load(session_id: str) -> dict[str, Any] | None:
-    with _lock:
-        path = _path(session_id)
-        if not path.exists():
+def load(
+    session_id: str,
+    *,
+    user_id: str | None = None,
+) -> dict[str, Any] | None:
+    uid = user_id or auth_context.get_user_id()
+    with connect() as conn:
+        if uid:
+            row = conn.execute(
+                "SELECT * FROM upload_sessions WHERE id = ? AND user_id = ?",
+                (session_id, uid),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM upload_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
             return None
-        return json.loads(path.read_text(encoding="utf-8"))
+        shard_rows = conn.execute(
+            """
+            SELECT i, account_id, remote_id, sha256, nonce
+            FROM upload_session_shards
+            WHERE session_id = ?
+            ORDER BY i
+            """,
+            (session_id,),
+        ).fetchall()
+        folder_rows = conn.execute(
+            """
+            SELECT account_id, remote_folder_id
+            FROM upload_session_remote_folders
+            WHERE session_id = ?
+            """,
+            (session_id,),
+        ).fetchall()
+    return _session_from_rows(row, shard_rows, folder_rows)
 
 
-def delete(session_id: str) -> None:
-    with _lock:
-        path = _path(session_id)
-        path.unlink(missing_ok=True)
+def delete(session_id: str, *, user_id: str | None = None) -> None:
+    uid = user_id or auth_context.get_user_id()
+    with connect() as conn:
+        if uid:
+            conn.execute(
+                "DELETE FROM upload_sessions WHERE id = ? AND user_id = ?",
+                (session_id, uid),
+            )
+        else:
+            conn.execute("DELETE FROM upload_sessions WHERE id = ?", (session_id,))
 
 
 def mark_failed(session_id: str, error: str) -> dict[str, Any] | None:

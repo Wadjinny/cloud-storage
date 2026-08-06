@@ -171,18 +171,26 @@ def _assert_chunked_roundtrip(
     else:
         # Avoid TestClient response buffering on huge bodies (WSL OOM).
         _step("download.start", file_id=file_id, via="service")
-        from tests.conftest import TEST_PASSPHRASE
+        from services import crypto
+        from storage import auth_context
+        from storage import users as users_store
+        from tests.conftest import TEST_PASSPHRASE, TEST_USERNAME
 
-        master_key = services_vault.unlock(TEST_PASSPHRASE)
+        user = users_store.get_by_username(TEST_USERNAME)
+        assert user is not None
+        master_key = crypto.derive_master_key(
+            TEST_PASSPHRASE, crypto.b64d(user["kdf_salt"])
+        )
         received = 0
 
         def _counting() -> Iterator[bytes]:
             nonlocal received
-            for chunk in services_vault.iter_download(master_key, file_id):
-                received += len(chunk)
-                if received == len(chunk) or received % progress_every < HTTP_FRAME:
-                    _step("download.stream.progress", received=received)
-                yield chunk
+            with auth_context.auth_scope(user["id"], master_key):
+                for chunk in services_vault.iter_download(master_key, file_id):
+                    received += len(chunk)
+                    if received == len(chunk) or received % progress_every < HTTP_FRAME:
+                        _step("download.stream.progress", received=received)
+                    yield chunk
 
         digest, total = sha256_of_iter(_counting())
 

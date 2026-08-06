@@ -2,6 +2,7 @@ import { apiUrl } from './base'
 
 export type VaultStatus = {
   unlocked: boolean
+  username: string | null
   initialized: boolean
   file_count: number
   account_count: number
@@ -127,16 +128,6 @@ export async function getVaultStatus(): Promise<VaultStatus> {
   const res = await fetch(apiUrl('/api/vault/status'), { credentials: 'include' })
   if (!res.ok) throw new Error(await readError(res))
   return res.json() as Promise<VaultStatus>
-}
-
-export async function unlockVault(passphrase: string): Promise<void> {
-  const res = await fetch(apiUrl('/api/vault/unlock'), {
-    method: 'POST',
-    credentials: 'include',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ passphrase }),
-  })
-  if (!res.ok) throw new Error(await readError(res))
 }
 
 export async function lockVault(): Promise<void> {

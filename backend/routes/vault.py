@@ -16,22 +16,19 @@ from starlette.requests import ClientDisconnect
 
 from config import choose_chunk_size
 from deps import require_unlocked
-from services import crypto
 from services import vault as vault_service
 from services.download_session import download_sessions
 from services.jobs import jobs
 from services.upload_pipeline import UploadCancelled, upload_pipelines
 from storage import accounts as accounts_store
+from storage import auth_context
 from storage import upload_sessions
+from storage import users as users_store
 from storage import vault_index
 
 log = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/vault", tags=["vault"])
-
-
-class UnlockBody(BaseModel):
-    passphrase: str = Field(min_length=1)
 
 
 class UploadStartBody(BaseModel):
@@ -44,31 +41,43 @@ class UploadResumeBody(BaseModel):
 
 
 @router.get("/status")
-def vault_status(request: Request) -> dict[str, bool | int]:
-    index = vault_index.load_index()
+def vault_status(request: Request) -> dict[str, bool | int | str | None]:
+    from services import crypto
+
+    unlocked = bool(request.session.get("vault_unlocked"))
+    user_id = request.session.get("user_id")
+    raw_key = request.session.get("master_key")
+    if unlocked and user_id and raw_key:
+        try:
+            master_key = crypto.b64d(raw_key)
+        except Exception:
+            pass
+        else:
+            with auth_context.auth_scope(str(user_id), master_key):
+                return {
+                    "unlocked": True,
+                    "username": request.session.get("username"),
+                    "initialized": users_store.user_count() > 0,
+                    "file_count": vault_index.count_files(),
+                    "account_count": accounts_store.count_accounts(),
+                }
     return {
-        "unlocked": bool(request.session.get("vault_unlocked")),
-        "initialized": bool(index.get("kdf_salt")),
-        "file_count": len(index.get("files", [])),
-        "account_count": len(accounts_store.load_accounts()),
+        "unlocked": False,
+        "username": None,
+        "initialized": users_store.user_count() > 0,
+        "file_count": 0,
+        "account_count": 0,
     }
-
-
-@router.post("/unlock")
-def vault_unlock(request: Request, body: UnlockBody) -> dict[str, bool]:
-    try:
-        master_key = vault_service.unlock(body.passphrase)
-    except ValueError as exc:
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
-    request.session["vault_unlocked"] = True
-    request.session["master_key"] = crypto.b64e(master_key)
-    return {"ok": True}
 
 
 @router.post("/lock")
 def vault_lock(request: Request) -> dict[str, bool]:
+    """Alias for logout (clears the unlocked session)."""
     request.session.pop("vault_unlocked", None)
+    request.session.pop("user_id", None)
+    request.session.pop("username", None)
     request.session.pop("master_key", None)
+    auth_context.clear_auth()
     return {"ok": True}
 
 
@@ -140,15 +149,16 @@ async def job_events(request: Request, job_id: str) -> StreamingResponse:
     )
 
 
-def _run_delete_job(job_id: str, file_id: str) -> None:
+def _run_delete_job(job_id: str, file_id: str, user_id: str, master_key: bytes) -> None:
     def on_progress(phase: str, current: int, total: int, message: str) -> None:
         jobs.update(job_id, phase=phase, current=current, total=total, message=message)
 
-    try:
-        vault_service.delete_file(file_id, on_progress)
-        jobs.complete(job_id)
-    except Exception as exc:
-        jobs.fail(job_id, str(exc))
+    with auth_context.auth_scope(user_id, master_key):
+        try:
+            vault_service.delete_file(file_id, on_progress)
+            jobs.complete(job_id)
+        except Exception as exc:
+            jobs.fail(job_id, str(exc))
 
 
 @router.post("/upload/start")
@@ -158,6 +168,7 @@ async def upload_start(
     path: str = Query(default="/"),
 ) -> dict:
     master_key = require_unlocked(request)
+    user_id = auth_context.require_user_id()
     if not accounts_store.load_accounts():
         raise HTTPException(status_code=400, detail="Connect at least one account before uploading")
 
@@ -175,6 +186,7 @@ async def upload_start(
     )
     pipeline = upload_pipelines.start(
         job_id=job.id,
+        user_id=user_id,
         master_key=master_key,
         path=path,
         filename=body.filename,
@@ -193,6 +205,7 @@ async def upload_start(
 async def upload_resume(request: Request, body: UploadResumeBody) -> dict:
     """Continue a failed upload session (skips shards already on providers)."""
     master_key = require_unlocked(request)
+    user_id = auth_context.require_user_id()
     if not accounts_store.load_accounts():
         raise HTTPException(status_code=400, detail="Connect at least one account before uploading")
 
@@ -223,6 +236,7 @@ async def upload_resume(request: Request, body: UploadResumeBody) -> dict:
     )
     pipeline = upload_pipelines.start(
         job_id=job.id,
+        user_id=user_id,
         master_key=master_key,
         path=session.get("path") or "/",
         filename=session["filename"],
@@ -405,6 +419,7 @@ async def upload_stream(request: Request, job_id: str) -> dict:
 @router.post("/download")
 async def start_download(request: Request, id: str = Query(...)) -> dict:
     master_key = require_unlocked(request)
+    user_id = auth_context.require_user_id()
     index = vault_index.load_index()
     entry = vault_index.find_file(index, id)
     if entry is None:
@@ -424,6 +439,7 @@ async def start_download(request: Request, id: str = Query(...)) -> dict:
     download_sessions.start(
         job_id=job.id,
         file_id=id,
+        user_id=user_id,
         master_key=master_key,
         filename=filename,
         size=size if isinstance(size, int) else None,
@@ -476,48 +492,49 @@ def download_stream(request: Request, job_id: str) -> StreamingResponse:
         )
 
     def generate():
-        try:
-            if session.cancel_requested.is_set():
-                jobs.request_cancel(job_id, "Download cancelled")
-                return
-            for chunk in vault_service.iter_download(
-                session.master_key,
-                session.file_id,
-                on_progress,
-                should_abort=lambda: (
-                    session.cancel_requested.is_set()
-                    or jobs.is_cancel_requested(job_id)
-                ),
-            ):
+        with auth_context.auth_scope(session.user_id, session.master_key):
+            try:
+                if session.cancel_requested.is_set():
+                    jobs.request_cancel(job_id, "Download cancelled")
+                    return
+                for chunk in vault_service.iter_download(
+                    session.master_key,
+                    session.file_id,
+                    on_progress,
+                    should_abort=lambda: (
+                        session.cancel_requested.is_set()
+                        or jobs.is_cancel_requested(job_id)
+                    ),
+                ):
+                    if session.cancel_requested.is_set() or jobs.is_cancel_requested(job_id):
+                        jobs.request_cancel(job_id, "Download cancelled")
+                        log.info("download cancelled job_id=%s", job_id)
+                        return
+                    yield chunk
                 if session.cancel_requested.is_set() or jobs.is_cancel_requested(job_id):
                     jobs.request_cancel(job_id, "Download cancelled")
                     log.info("download cancelled job_id=%s", job_id)
                     return
-                yield chunk
-            if session.cancel_requested.is_set() or jobs.is_cancel_requested(job_id):
+                jobs.complete(job_id, result_name=session.filename)
+            except GeneratorExit:
+                session.cancel_requested.set()
+                jobs.request_cancel(job_id, "Client disconnected")
+                raise
+            except vault_service.DownloadCancelled:
                 jobs.request_cancel(job_id, "Download cancelled")
                 log.info("download cancelled job_id=%s", job_id)
                 return
-            jobs.complete(job_id, result_name=session.filename)
-        except GeneratorExit:
-            session.cancel_requested.set()
-            jobs.request_cancel(job_id, "Client disconnected")
-            raise
-        except vault_service.DownloadCancelled:
-            jobs.request_cancel(job_id, "Download cancelled")
-            log.info("download cancelled job_id=%s", job_id)
-            return
-        except Exception as exc:
-            if session.cancel_requested.is_set() or jobs.is_cancel_requested(job_id):
-                jobs.request_cancel(job_id, "Download cancelled")
-                log.info("download cancelled job_id=%s", job_id)
-                return
-            job = jobs.get(job_id)
-            if job is None or job.status == "running":
-                jobs.fail(job_id, str(exc))
-            raise
-        finally:
-            download_sessions.finish(job_id)
+            except Exception as exc:
+                if session.cancel_requested.is_set() or jobs.is_cancel_requested(job_id):
+                    jobs.request_cancel(job_id, "Download cancelled")
+                    log.info("download cancelled job_id=%s", job_id)
+                    return
+                job = jobs.get(job_id)
+                if job is None or job.status == "running":
+                    jobs.fail(job_id, str(exc))
+                raise
+            finally:
+                download_sessions.finish(job_id)
 
     headers = {
         "Content-Disposition": f'attachment; filename="{session.filename}"',
@@ -535,7 +552,8 @@ def download_stream(request: Request, job_id: str) -> StreamingResponse:
 
 @router.delete("/files/{file_id}")
 async def delete_file(request: Request, file_id: str) -> dict:
-    require_unlocked(request)
+    master_key = require_unlocked(request)
+    user_id = auth_context.require_user_id()
     index = vault_index.load_index()
     if vault_index.find_file(index, file_id) is None:
         raise HTTPException(status_code=404, detail="File not found")
@@ -544,7 +562,7 @@ async def delete_file(request: Request, file_id: str) -> dict:
     jobs.update(job.id, phase="queued", message="Starting delete…", current=0, total=1)
     thread = threading.Thread(
         target=_run_delete_job,
-        args=(job.id, file_id),
+        args=(job.id, file_id, user_id, master_key),
         daemon=True,
     )
     thread.start()

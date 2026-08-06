@@ -56,9 +56,13 @@ class GDriveProvider:
         credentials: dict[str, Any],
         *,
         account_id: str | None = None,
+        user_id: str | None = None,
+        master_key: bytes | None = None,
     ) -> None:
         # Empty string tokens break google-auth (treated as present but invalid).
         self._account_id = account_id
+        self._user_id = user_id
+        self._master_key = master_key
         self._refresh_token = credentials.get("refresh_token") or None
         self._creds_lock = threading.Lock()
         self._creds = Credentials(
@@ -97,6 +101,8 @@ class GDriveProvider:
                 "refresh_token": self._creds.refresh_token or self._refresh_token,
                 "expiry": expiry.isoformat() if expiry is not None else None,
             },
+            user_id=self._user_id,
+            master_key=self._master_key,
         )
         self._persisted_token = token
 
