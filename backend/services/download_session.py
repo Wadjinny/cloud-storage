@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from services.jobs import jobs
 
@@ -13,6 +13,8 @@ class DownloadSession:
     master_key: bytes
     filename: str
     size: int | None
+    cancel_requested: threading.Event = field(default_factory=threading.Event)
+    stream_claimed: bool = False
 
 
 class DownloadSessionHub:
@@ -40,23 +42,37 @@ class DownloadSessionHub:
             self._sessions[job_id] = session
         return session
 
-    def take(self, job_id: str) -> DownloadSession | None:
+    def claim_stream(self, job_id: str) -> DownloadSession | None:
+        """Hand the session to the stream generator (once)."""
         with self._lock:
-            return self._sessions.pop(job_id, None)
+            session = self._sessions.get(job_id)
+            if session is None or session.stream_claimed:
+                return None
+            session.stream_claimed = True
+            return session
 
     def get(self, job_id: str) -> DownloadSession | None:
         with self._lock:
             return self._sessions.get(job_id)
 
-    def abort(self, job_id: str, message: str = "Download aborted") -> None:
+    def finish(self, job_id: str) -> None:
         with self._lock:
-            session = self._sessions.pop(job_id, None)
-        # Only fail the job if the stream never started (session still pending).
-        if session is None:
-            return
+            self._sessions.pop(job_id, None)
+
+    def abort(self, job_id: str, message: str = "Download cancelled") -> bool:
+        """Cancel a pending or in-flight download. Returns False if unknown."""
+        with self._lock:
+            session = self._sessions.get(job_id)
+            known = session is not None
+            if session is not None:
+                session.cancel_requested.set()
+                if not session.stream_claimed:
+                    self._sessions.pop(job_id, None)
         job = jobs.get(job_id)
-        if job is not None and job.status not in ("done", "error"):
-            jobs.fail(job_id, message)
+        if job is None and not known:
+            return False
+        jobs.request_cancel(job_id, message)
+        return True
 
 
 download_sessions = DownloadSessionHub()

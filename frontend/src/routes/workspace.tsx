@@ -21,15 +21,45 @@ import {
   unlockVault,
   uploadVaultFile,
   type ProgressUpdate,
+  type UploadAccountStats,
+  type UploadJobStats,
   type VaultEntry,
 } from '../api/vault'
 
-function formatBytes(n: number | null): string {
+const RATE_WINDOW_MS = 60_000
+const ERROR_AUTO_HIDE_MS = 60_000
+
+type RateSample = { t: number; shards: number; bytes: number }
+
+type AccountRate = { shardsPerSec: number; mbPerSec: number }
+
+type TransferState = {
+  kind: 'upload' | 'download' | 'delete'
+  percent: number
+  message: string
+  doneBytes?: number | null
+  totalBytes?: number | null
+  doneShards?: number
+  expectedShards?: number | null
+  activeShards?: number
+  shardsPerSec?: number | null
+  mbPerSec?: number | null
+  byAccount?: UploadAccountStats[]
+  accountRates?: Record<string, AccountRate>
+}
+
+function formatBytes(n: number | null | undefined): string {
   if (n == null) return '—'
   if (n < 1024) return `${n} B`
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
   if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`
   return `${(n / (1024 * 1024 * 1024)).toFixed(2)} GB`
+}
+
+function formatRate(n: number | null | undefined, unit: string): string {
+  if (n == null || !Number.isFinite(n)) return `— ${unit}`
+  if (n < 10) return `${n.toFixed(2)} ${unit}`
+  return `${n.toFixed(1)} ${unit}`
 }
 
 function storagePct(used: number | null, total: number | null): number | null {
@@ -42,6 +72,88 @@ function pathParts(path: string): string[] {
   return path.replace(/^\//, '').split('/').filter(Boolean)
 }
 
+function rateFromSamples(samples: RateSample[]): AccountRate | null {
+  if (samples.length < 2) return null
+  const first = samples[0]
+  const last = samples[samples.length - 1]
+  const dt = (last.t - first.t) / 1000
+  if (dt < 0.5) return null
+  const dShards = Math.max(0, last.shards - first.shards)
+  const dBytes = Math.max(0, last.bytes - first.bytes)
+  return {
+    shardsPerSec: dShards / dt,
+    mbPerSec: dBytes / (1024 * 1024) / dt,
+  }
+}
+
+function pruneSamples(samples: RateSample[], now: number): RateSample[] {
+  const cutoff = now - RATE_WINDOW_MS
+  let i = 0
+  while (i < samples.length && samples[i].t < cutoff) i++
+  return samples.slice(i)
+}
+
+function pushSample(samples: RateSample[], shards: number, bytes: number, now: number): RateSample[] {
+  // Always return a new array so callers can replace refs without clearing in place.
+  const next = pruneSamples(samples, now)
+  const last = next[next.length - 1]
+  if (last && last.shards === shards && last.bytes === bytes && now - last.t < 250) {
+    return next
+  }
+  next.push({ t: now, shards, bytes })
+  return next
+}
+
+function applyTransferRates(
+  stats: UploadJobStats,
+  overallRef: { current: RateSample[] },
+  byAccount: Map<string, RateSample[]>,
+): Pick<
+  TransferState,
+  | 'shardsPerSec'
+  | 'mbPerSec'
+  | 'byAccount'
+  | 'accountRates'
+  | 'doneBytes'
+  | 'totalBytes'
+  | 'doneShards'
+  | 'expectedShards'
+  | 'activeShards'
+> {
+  const now = Date.now()
+  overallRef.current = pushSample(
+    overallRef.current,
+    stats.done_shards,
+    stats.done_bytes,
+    now,
+  )
+  const overallRate = rateFromSamples(overallRef.current)
+
+  const accountRates: Record<string, AccountRate> = {}
+  for (const row of stats.by_account) {
+    const next = pushSample(byAccount.get(row.account_id) ?? [], row.shards, row.bytes, now)
+    byAccount.set(row.account_id, next)
+    const rate = rateFromSamples(next)
+    if (rate) accountRates[row.account_id] = rate
+  }
+
+  const activeShards =
+    stats.active_shards ??
+    stats.by_account.reduce((sum, row) => sum + (row.active ?? 0), 0)
+
+  return {
+    doneBytes: stats.done_bytes,
+    totalBytes: stats.total_bytes,
+    doneShards: stats.done_shards,
+    expectedShards: stats.expected_shards,
+    activeShards,
+    shardsPerSec: overallRate?.shardsPerSec ?? null,
+    mbPerSec: overallRate?.mbPerSec ?? null,
+    byAccount: stats.by_account,
+    accountRates,
+  }
+}
+
 function batchProgress(
   index: number,
   total: number,
@@ -51,6 +163,67 @@ function batchProgress(
   const percent = Math.min(100, Math.round(index * span + (update.percent / 100) * span))
   const message = total > 1 ? `${index + 1}/${total}: ${update.message}` : update.message
   return { percent, message }
+}
+
+function ShardBoxesBar({
+  done,
+  active = 0,
+  total,
+  variant = 'transfer',
+}: {
+  done: number
+  /** Boxes after `done` that are in-flight on this provider. */
+  active?: number
+  total: number
+  variant?: 'transfer' | 'account'
+}) {
+  const filled = Math.max(0, Math.floor(done))
+  const inFlight = Math.max(0, Math.floor(active))
+  const n = Math.max(1, Math.floor(total), filled + inFlight)
+  const prevFilledRef = useRef(filled)
+  const [pulseFrom, setPulseFrom] = useState<number | null>(null)
+
+  useEffect(() => {
+    const prev = prevFilledRef.current
+    prevFilledRef.current = filled
+    if (filled <= prev) {
+      setPulseFrom(null)
+      return
+    }
+    setPulseFrom(prev)
+    const t = window.setTimeout(() => setPulseFrom(null), 700)
+    return () => window.clearTimeout(t)
+  }, [filled])
+
+  return (
+    <div
+      className={`shard-boxes shard-boxes-${variant}`}
+      role="progressbar"
+      aria-valuenow={filled}
+      aria-valuemin={0}
+      aria-valuemax={n}
+      title={`${filled} done · ${inFlight} active / ${n} shards`}
+    >
+      {Array.from({ length: n }, (_, i) => {
+        const isDone = i < filled
+        const isActive = !isDone && i < filled + inFlight
+        const isPulse = isDone && pulseFrom != null && i >= pulseFrom
+        return (
+          <span
+            key={i}
+            className={[
+              'shard-box',
+              isDone ? 'shard-box-done' : '',
+              isActive ? 'shard-box-active' : '',
+              isPulse ? 'shard-box-pulse' : '',
+            ]
+              .filter(Boolean)
+              .join(' ')}
+          />
+        )
+      })}
+    </div>
+  )
 }
 
 export default function Workspace() {
@@ -66,13 +239,36 @@ export default function Workspace() {
   const [megaPassword, setMegaPassword] = useState('')
   const [megaMfa, setMegaMfa] = useState('')
   const [passphrase, setPassphrase] = useState('')
-  const [transfer, setTransfer] = useState<{
-    kind: 'upload' | 'download' | 'delete'
-    percent: number
-    message: string
-  } | null>(null)
+  const [transfer, setTransfer] = useState<TransferState | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const uploadAbortRef = useRef<AbortController | null>(null)
+  const downloadAbortRef = useRef<AbortController | null>(null)
+  const transferRateSamplesRef = useRef<RateSample[]>([])
+  const transferAccountRateSamplesRef = useRef<Map<string, RateSample[]>>(new Map())
+
+  function resetTransferRates() {
+    transferRateSamplesRef.current = []
+    transferAccountRateSamplesRef.current = new Map()
+  }
+
+  function onShardTransferProgress(
+    kind: 'upload' | 'download',
+    index: number,
+    total: number,
+    update: ProgressUpdate,
+  ) {
+    const mapped = batchProgress(index, total, update)
+    if (!update.stats) {
+      setTransfer({ kind, ...mapped })
+      return
+    }
+    const rates = applyTransferRates(
+      update.stats,
+      transferRateSamplesRef,
+      transferAccountRateSamplesRef.current,
+    )
+    setTransfer({ kind, ...mapped, ...rates })
+  }
 
   const accountsQuery = useQuery({
     queryKey: ['accounts'],
@@ -195,21 +391,21 @@ export default function Workspace() {
     mutationFn: async (files: File[]) => {
       const ac = new AbortController()
       uploadAbortRef.current = ac
+      resetTransferRates()
       try {
         for (let i = 0; i < files.length; i++) {
           if (ac.signal.aborted) throw new Error('Upload cancelled')
+          resetTransferRates()
           await uploadVaultFile(
             path,
             files[i],
-            (u) => {
-              const mapped = batchProgress(i, files.length, u)
-              setTransfer({ kind: 'upload', ...mapped })
-            },
+            (u) => onShardTransferProgress('upload', i, files.length, u),
             { signal: ac.signal },
           )
         }
       } finally {
         uploadAbortRef.current = null
+        resetTransferRates()
       }
     },
     onSuccess: async () => {
@@ -224,14 +420,32 @@ export default function Workspace() {
     },
   })
 
+  useEffect(() => {
+    if (!error) return
+    const t = window.setTimeout(() => setError(null), ERROR_AUTO_HIDE_MS)
+    return () => window.clearTimeout(t)
+  }, [error])
+
   const downloadMut = useMutation({
     mutationFn: async (files: VaultEntry[]) => {
-      for (let i = 0; i < files.length; i++) {
-        const entry = files[i]
-        await downloadVaultFile(entry.id, entry.name, (u) => {
-          const mapped = batchProgress(i, files.length, u)
-          setTransfer({ kind: 'download', ...mapped })
-        })
+      const ac = new AbortController()
+      downloadAbortRef.current = ac
+      resetTransferRates()
+      try {
+        for (let i = 0; i < files.length; i++) {
+          if (ac.signal.aborted) throw new Error('Download cancelled')
+          resetTransferRates()
+          const entry = files[i]
+          await downloadVaultFile(
+            entry.id,
+            entry.name,
+            (u) => onShardTransferProgress('download', i, files.length, u),
+            { signal: ac.signal },
+          )
+        }
+      } finally {
+        downloadAbortRef.current = null
+        resetTransferRates()
       }
     },
     onSuccess: () => setTransfer(null),
@@ -240,6 +454,17 @@ export default function Workspace() {
       setError(e.message)
     },
   })
+
+  useEffect(() => {
+    if (!uploadMut.isPending && !downloadMut.isPending) return
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault()
+      // Chrome requires returnValue to be set to show the confirmation dialog.
+      e.returnValue = ''
+    }
+    window.addEventListener('beforeunload', onBeforeUnload)
+    return () => window.removeEventListener('beforeunload', onBeforeUnload)
+  }, [uploadMut.isPending, downloadMut.isPending])
 
   const deleteFileMut = useMutation({
     mutationFn: async (files: VaultEntry[]) => {
@@ -351,7 +576,19 @@ export default function Workspace() {
         </div>
       </header>
 
-      {error ? <div className="error-bar">{error}</div> : null}
+      {error ? (
+        <div className="error-bar">
+          <span className="error-bar-text">{error}</span>
+          <button
+            type="button"
+            className="btn-micro btn-danger error-bar-close"
+            aria-label="Dismiss error"
+            onClick={() => setError(null)}
+          >
+            ×
+          </button>
+        </div>
+      ) : null}
 
       {transfer ? (
         <div className="transfer-bar">
@@ -365,6 +602,28 @@ export default function Workspace() {
             </span>
             <span className="transfer-msg">{transfer.message}</span>
             <span className="transfer-pct">{transfer.percent}%</span>
+            {(transfer.kind === 'upload' || transfer.kind === 'download') &&
+            transfer.doneShards != null ? (
+              <span className="transfer-stats" title="Shards done / expected · active">
+                {transfer.doneShards}
+                {transfer.expectedShards != null ? `/${transfer.expectedShards}` : ''} sh
+                {(transfer.activeShards ?? 0) > 0 ? (
+                  <span className="transfer-active"> · {transfer.activeShards} active</span>
+                ) : null}
+              </span>
+            ) : null}
+            {(transfer.kind === 'upload' || transfer.kind === 'download') &&
+            transfer.doneBytes != null ? (
+              <span className="transfer-stats" title="Transferred / total">
+                {formatBytes(transfer.doneBytes)}
+                {transfer.totalBytes != null ? ` / ${formatBytes(transfer.totalBytes)}` : ''}
+              </span>
+            ) : null}
+            {transfer.kind === 'upload' || transfer.kind === 'download' ? (
+              <span className="transfer-stats" title="1 min average">
+                {formatRate(transfer.shardsPerSec, 'sh/s')} · {formatRate(transfer.mbPerSec, 'MB/s')}
+              </span>
+            ) : null}
             {transfer.kind === 'upload' ? (
               <button
                 type="button"
@@ -374,10 +633,32 @@ export default function Workspace() {
                 Cancel
               </button>
             ) : null}
+            {transfer.kind === 'download' ? (
+              <button
+                type="button"
+                className="btn-micro btn-danger"
+                onClick={() => downloadAbortRef.current?.abort()}
+              >
+                Cancel
+              </button>
+            ) : null}
           </div>
-          <div className="transfer-track">
-            <div className="transfer-fill" style={{ width: `${transfer.percent}%` }} />
-          </div>
+          {(transfer.kind === 'upload' || transfer.kind === 'download') &&
+          (transfer.expectedShards != null || (transfer.doneShards ?? 0) > 0) ? (
+            <ShardBoxesBar
+              done={transfer.doneShards ?? 0}
+              active={transfer.activeShards ?? 0}
+              total={Math.max(
+                transfer.expectedShards ?? 0,
+                (transfer.doneShards ?? 0) + (transfer.activeShards ?? 0),
+                1,
+              )}
+            />
+          ) : (
+            <div className="transfer-track">
+              <div className="transfer-fill" style={{ width: `${transfer.percent}%` }} />
+            </div>
+          )}
         </div>
       ) : null}
 
@@ -405,6 +686,13 @@ export default function Workspace() {
                       {accountsQuery.data.map((account: Account) => {
                         const stats = storageById.get(account.id)
                         const pct = storagePct(stats?.used ?? null, stats?.total ?? null)
+                        const uploadRow =
+                          transfer?.kind === 'upload' || transfer?.kind === 'download'
+                            ? transfer.byAccount?.find((a) => a.account_id === account.id)
+                            : undefined
+                        const uploadRate = uploadRow
+                          ? transfer?.accountRates?.[account.id]
+                          : undefined
                         return (
                           <div key={account.id} className="account-card">
                             <div className="list-row">
@@ -453,6 +741,33 @@ export default function Workspace() {
                                   </div>
                                 </>
                               )}
+                              {uploadRow ? (
+                                <div className="upload-account-stats">
+                                  <ShardBoxesBar
+                                    variant="account"
+                                    done={uploadRow.shards}
+                                    active={uploadRow.active ?? 0}
+                                    total={Math.max(
+                                      uploadRow.estimated_shards,
+                                      uploadRow.shards + (uploadRow.active ?? 0),
+                                      1,
+                                    )}
+                                  />
+                                  <div className="storage-meta">
+                                    <span title="Shards done / estimated share (+ active)">
+                                      {uploadRow.shards}/{uploadRow.estimated_shards} sh
+                                      {(uploadRow.active ?? 0) > 0
+                                        ? ` (+${uploadRow.active})`
+                                        : ''}{' '}
+                                      · {formatBytes(uploadRow.bytes)}
+                                    </span>
+                                    <span title="1 min average">
+                                      {formatRate(uploadRate?.shardsPerSec, 'sh/s')} ·{' '}
+                                      {formatRate(uploadRate?.mbPerSec, 'MB/s')}
+                                    </span>
+                                  </div>
+                                </div>
+                              ) : null}
                             </div>
                           </div>
                         )

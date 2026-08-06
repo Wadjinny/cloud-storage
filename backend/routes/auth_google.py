@@ -80,12 +80,14 @@ def google_callback(request: Request, code: str | None = None, state: str | None
     info = service.userinfo().get().execute()
     email = info.get("email") or "gdrive"
 
+    expiry = creds.expiry.isoformat() if creds.expiry is not None else None
     accounts_store.add_account(
         provider="gdrive",
         label=email,
         credentials={
             "token": creds.token,
             "refresh_token": creds.refresh_token,
+            "expiry": expiry,
         },
     )
     return RedirectResponse(f"{FRONTEND_URL.rstrip('/')}/?connected=gdrive")

@@ -407,16 +407,125 @@ body,
 }
 
 .error-bar {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
   background: var(--error-bg);
   color: var(--error);
   font-family: var(--mono);
   font-size: 11px;
   padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.error-bar-text {
+  flex: 1;
+  min-width: 0;
   white-space: pre-wrap;
   max-height: 80px;
   overflow: auto;
-  border-bottom: 1px solid var(--border);
+}
+
+.error-bar-close {
   flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.upload-account-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px dashed var(--border);
+}
+
+.transfer-stats {
+  font-family: var(--mono);
+  color: var(--data);
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.transfer-active {
+  color: var(--accent);
+}
+
+.shard-boxes {
+  display: flex;
+  gap: 1px;
+  width: 100%;
+  min-width: 0;
+  height: 8px;
+}
+
+.shard-boxes-account {
+  height: 6px;
+}
+
+.shard-box {
+  flex: 1 1 0;
+  min-width: 1px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 1px;
+  box-sizing: border-box;
+}
+
+.shard-boxes-transfer .shard-box-done {
+  background: var(--data);
+  border-color: var(--data);
+}
+
+.shard-boxes-account .shard-box-done {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.shard-box-active {
+  background: var(--accent-tint, #0e639c44);
+  border-color: var(--accent);
+  animation: shard-active-pulse 1s ease-in-out infinite alternate;
+}
+
+.shard-boxes-transfer .shard-box-pulse {
+  animation: shard-flash-transfer 0.7s ease-out;
+}
+
+.shard-boxes-account .shard-box-pulse {
+  animation: shard-flash-account 0.7s ease-out;
+}
+
+@keyframes shard-active-pulse {
+  0% {
+    background: var(--accent-tint, #0e639c44);
+  }
+  100% {
+    background: #0e639c88;
+  }
+}
+
+@keyframes shard-flash-transfer {
+  0% {
+    background: var(--data-bright, #7ee0c8);
+    border-color: var(--data-bright, #7ee0c8);
+  }
+  100% {
+    background: var(--data);
+    border-color: var(--data);
+  }
+}
+
+@keyframes shard-flash-account {
+  0% {
+    background: #3b9fd4;
+    border-color: #3b9fd4;
+  }
+  100% {
+    background: var(--accent);
+    border-color: var(--accent);
+  }
 }
 
 .transfer-bar {

@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 from config import ACCOUNTS_PATH, DATA_DIR
 
-ProviderName = Literal["gdrive", "mega"]
+ProviderName = Literal["gdrive", "mega", "memory"]
 
 _lock = threading.Lock()
 
@@ -88,3 +88,17 @@ def delete_account(account_id: str) -> bool:
         return False
     save_accounts(next_accounts)
     return True
+
+
+def update_credentials(account_id: str, credentials: dict[str, Any]) -> bool:
+    """Merge credentials into an existing account (e.g. refreshed OAuth tokens)."""
+    accounts = load_accounts()
+    for account in accounts:
+        if account["id"] != account_id:
+            continue
+        merged = dict(account.get("credentials") or {})
+        merged.update(credentials)
+        account["credentials"] = merged
+        save_accounts(accounts)
+        return True
+    return False

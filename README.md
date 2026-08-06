@@ -15,26 +15,25 @@ Encrypted, sharded personal vault that spreads opaque file chunks across Google 
 
 - Connect **Google Drive** (OAuth) and **MEGA** (email/password) from the UI
 - Unlock a vault with a passphrase (keys stay in the server session)
-- Upload encrypts, splits into 4 MiB shards, and stripes across connected accounts
+- Upload encrypts, splits into ~16 MiB shards (MEGA-tuned, serial by default), and stripes across connected accounts
 - Download reassembles and decrypts; delete removes shards + index entry
 - One account is enough; more accounts increase stripe width
 
 ## Run locally
 
-**Backend** (http://127.0.0.1:1234)
+**Backend** (http://localhost:1234)
 
 ```bash
 cd backend
 uv sync
-# optional Google OAuth:
-# export GOOGLE_CLIENT_ID=...
-# export GOOGLE_CLIENT_SECRET=...
-# export FRONTEND_URL=http://127.0.0.1:5173
-# export GOOGLE_REDIRECT_URI=http://127.0.0.1:5173/api/auth/google/callback
+# optional Google OAuth (see backend/.env):
+# FRONTEND_URL=http://localhost:5173
+# API_PUBLIC_URL=http://localhost:1234
+# GOOGLE_REDIRECT_URI=http://localhost:1234/api/auth/google/callback
 uv run main.py
 ```
 
-**Frontend**
+**Frontend** (calls the API via `VITE_API_BASE`, no Vite proxy)
 
 ```bash
 cd frontend
@@ -42,7 +41,7 @@ pnpm install
 pnpm dev
 ```
 
-Open http://127.0.0.1:5173 — Vite proxies `/api` to the backend. Google OAuth start and callback must use this same origin (not `:1234`) so the session cookie is available on callback.
+Open http://localhost:5173 (use `localhost`, not `127.0.0.1`, so session cookies stay same-site with `http://localhost:1234`). Prod builds leave `VITE_API_BASE` empty and hit same-origin `/api` through Caddy.
 
 ## Google OAuth setup
 
@@ -50,9 +49,9 @@ Open http://127.0.0.1:5173 — Vite proxies `/api` to the backend. Google OAuth 
 2. Configure an OAuth consent screen.
 3. Create an OAuth client ID (Web application).
 4. Add authorized redirect URIs:
-   - Local: exact Vite origin + `/api/auth/google/callback` (e.g. `http://localhost:5173/api/auth/google/callback`). `localhost` and `127.0.0.1` are different to Google.
+   - Local: `http://localhost:1234/api/auth/google/callback` (`localhost` and `127.0.0.1` are different to Google).
    - Prod: `https://cloud-storage.w-ilyas.site/api/auth/google/callback`
-5. Set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `FRONTEND_URL`, and `GOOGLE_REDIRECT_URI` in `backend/.env`.
+5. Set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `FRONTEND_URL`, `API_PUBLIC_URL`, and `GOOGLE_REDIRECT_URI` in `backend/.env`.
 
 Without Google env vars, **+ Google** returns 503; MEGA still works.
 

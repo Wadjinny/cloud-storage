@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
-from config import FRONTEND_URL, SESSION_SECRET
+from config import SESSION_SECRET, cors_allow_origins
 from routes.accounts import router as accounts_router
 from routes.auth_google import router as auth_google_router
 from routes.auth_mega import router as auth_mega_router
@@ -18,7 +18,7 @@ app.add_middleware(
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL.rstrip("/")],
+    allow_origins=cors_allow_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -36,9 +36,32 @@ def health() -> dict[str, str]:
 
 
 def main() -> None:
+    import logging
+    import os
+
     import uvicorn
 
-    uvicorn.run("main:app", host="127.0.0.1", port=1234, reload=True)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        datefmt="%H:%M:%S",
+        force=True,
+    )
+
+    # Reloading mid-upload kills the job. Set UVICORN_RELOAD=0 for large transfers.
+    reload = os.environ.get("UVICORN_RELOAD", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+    # Listen on loopback so both http://localhost:1234 and http://127.0.0.1:1234 work.
+    uvicorn.run(
+        "main:app",
+        host="127.0.0.1",
+        port=1234,
+        reload=reload,
+        reload_excludes=["**/tests/**", "**/data/**", "**/.venv/**", "**/__pycache__/**"],
+    )
 
 
 if __name__ == "__main__":

@@ -106,8 +106,12 @@ class PlacementPlanner:
             total += room
         return total
 
-    def pick(self, need: int) -> str:
-        """Reserve ``need`` bytes on an eligible account and return its id."""
+    def pick(self, need: int, *, only: set[str] | None = None) -> str:
+        """Reserve ``need`` bytes on an eligible account and return its id.
+
+        If ``only`` is set, only those account ids are considered (used to skip
+        accounts that are already at their upload concurrency cap).
+        """
         with self._lock:
             n = len(self.quotas)
             if n == 0:
@@ -116,14 +120,17 @@ class PlacementPlanner:
             for offset in range(n):
                 idx = (self._cursor + offset) % n
                 q = self.quotas[idx]
+                if only is not None and q.account_id not in only:
+                    continue
                 if q.can_fit(need):
                     q.reserved += need
                     self._cursor = idx + 1
                     return q.account_id
 
             ratio_pct = int(round(STORAGE_FULL_RATIO * 100))
+            scope = "selected " if only is not None else ""
             raise ValueError(
-                f"No connected account has enough free space under the "
+                f"No connected {scope}account has enough free space under the "
                 f"{ratio_pct}% full threshold for the next shard "
                 f"({need} bytes needed)"
             )

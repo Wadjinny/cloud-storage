@@ -1,33 +1,88 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
+import queue
 import secrets
 import tempfile
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import PurePosixPath
 from typing import Any, BinaryIO
 
-from config import CHUNK_SIZE, DOWNLOAD_QUEUE_DEPTH, SHARD_CONCURRENCY, STORAGE_FULL_RATIO
+from config import (
+    DOWNLOAD_QUEUE_DEPTH,
+    GDRIVE_ACCOUNT_DOWNLOAD_CONCURRENCY,
+    GDRIVE_ACCOUNT_UPLOAD_CONCURRENCY,
+    MEGA_ACCOUNT_DOWNLOAD_CONCURRENCY,
+    MEGA_ACCOUNT_UPLOAD_CONCURRENCY,
+    SHARD_DOWNLOAD_CONCURRENCY,
+    SHARD_UPLOAD_CONCURRENCY,
+    STORAGE_FULL_RATIO,
+    choose_chunk_size,
+)
 from providers.factory import get_provider
 from services import crypto
 from services.capacity import PlacementPlanner, cipher_size
 from storage import accounts as accounts_store
+from storage import upload_sessions
 from storage import vault_index
 
-ProgressFn = Callable[[str, int, int, str], None]
+log = logging.getLogger(__name__)
 
 
-def _progress(cb: ProgressFn | None, phase: str, current: int, total: int, message: str) -> None:
-    if cb:
+class DownloadCancelled(RuntimeError):
+    """Raised when a download job is aborted by the user or client disconnect."""
+
+
+# phase, current, total, message, optional stats dict
+ProgressFn = Callable[..., None]
+
+
+def _progress(
+    cb: ProgressFn | None,
+    phase: str,
+    current: int,
+    total: int,
+    message: str,
+    *,
+    stats: dict[str, Any] | None = None,
+) -> None:
+    if not cb:
+        return
+    try:
+        cb(phase, current, total, message, stats)
+    except TypeError:
         cb(phase, current, total, message)
 
 
 def _providers_by_id(account_list: list[dict[str, Any]]) -> dict[str, Any]:
     return {a["id"]: get_provider(a) for a in account_list}
+
+
+def discard_upload_session(session_id: str) -> None:
+    """Delete a partial upload session and its per-account remote folders."""
+    session = upload_sessions.load(session_id)
+    if session is None:
+        return
+    account_list = accounts_store.load_accounts()
+    providers = _providers_by_id(account_list)
+    for account_id, folder_id in (session.get("remote_folders") or {}).items():
+        provider = providers.get(account_id)
+        if provider is None:
+            continue
+        try:
+            provider.delete(folder_id)
+        except Exception:
+            log.exception(
+                "discard_upload_session folder delete failed session=%s account=%s",
+                session_id,
+                account_id,
+            )
+    upload_sessions.delete(session_id)
 
 
 def unlock(passphrase: str) -> bytes:
@@ -166,19 +221,39 @@ def _join_path(dir_path: str, name: str) -> str:
     return f"{base}/{name}"
 
 
-def _worker_count(n_tasks: int) -> int:
-    return max(1, min(SHARD_CONCURRENCY, max(1, n_tasks)))
+def _worker_count(n_tasks: int, *, download: bool = False) -> int:
+    limit = SHARD_DOWNLOAD_CONCURRENCY if download else SHARD_UPLOAD_CONCURRENCY
+    return max(1, min(limit, max(1, n_tasks)))
 
 
-def _iter_plaintext_chunks(source: BinaryIO) -> Any:
-    """Yield CHUNK_SIZE plaintext pieces from a binary stream (one empty chunk if empty)."""
+def _provider_account_limit(provider: str, *, workers: int, download: bool = False) -> int:
+    """Per-account in-flight cap for a provider, never above the job worker pool."""
+    if provider == "mega":
+        configured = (
+            MEGA_ACCOUNT_DOWNLOAD_CONCURRENCY
+            if download
+            else MEGA_ACCOUNT_UPLOAD_CONCURRENCY
+        )
+    elif provider == "gdrive":
+        configured = (
+            GDRIVE_ACCOUNT_DOWNLOAD_CONCURRENCY
+            if download
+            else GDRIVE_ACCOUNT_UPLOAD_CONCURRENCY
+        )
+    else:
+        configured = workers
+    return max(1, min(workers, max(1, configured)))
+
+
+def _iter_plaintext_chunks(source: BinaryIO, chunk_size: int) -> Any:
+    """Yield ``chunk_size`` plaintext pieces from a binary stream (one empty chunk if empty)."""
     saw_data = False
     while True:
-        plain = source.read(CHUNK_SIZE)
+        plain = source.read(chunk_size)
         if plain:
             saw_data = True
             yield plain
-            if len(plain) < CHUNK_SIZE:
+            if len(plain) < chunk_size:
                 break
         elif saw_data:
             break
@@ -194,31 +269,88 @@ def upload_file(
     chunks: Any,
     *,
     size: int | None = None,
+    chunk_size: int | None = None,
     on_progress: ProgressFn | None = None,
     should_abort: Callable[[], bool] | None = None,
+    on_chunk_done: Callable[[], None] | None = None,
+    session_id: str | None = None,
+    resume_from_byte: int = 0,
 ) -> dict[str, Any]:
     """Encrypt and upload from an iterable of plaintext chunks.
 
-    ``chunks`` yields up to CHUNK_SIZE bytes each (final chunk may be shorter;
-    empty files yield a single ``b""``). At most ~SHARD_CONCURRENCY uploads run
-    at once; callers should bound how many chunk buffers exist upstream.
+    ``chunks`` yields up to ``chunk_size`` bytes each (final chunk may be shorter;
+    empty files yield a single ``b""``). At most ``SHARD_UPLOAD_CONCURRENCY`` encrypt
+    uploads run at once, and the next chunk is only pulled once a slot is free
+    so RAM stays O(concurrency × shard size) regardless of file size.
+
+    When ``session_id`` refers to a persisted upload session, completed shards are
+    skipped and ``resume_from_byte`` is the file offset of the first chunk in
+    ``chunks`` (0 if the client re-streams the whole file).
     """
+    shard_size = chunk_size if chunk_size is not None else choose_chunk_size(size)
+    if shard_size < 1:
+        raise ValueError("chunk_size must be >= 1")
+    if resume_from_byte < 0 or (
+        resume_from_byte > 0 and resume_from_byte % shard_size != 0
+    ):
+        raise ValueError("resume_from_byte must be a non-negative multiple of chunk_size")
+
     account_list = accounts_store.load_accounts()
     if not account_list:
         raise ValueError("Connect at least one account before uploading")
 
     planner = PlacementPlanner.from_accounts(account_list)
-    file_id = f"f_{secrets.token_hex(8)}"
-    file_key = crypto.new_file_key()
     providers_by_id = _providers_by_id(account_list)
 
+    existing = upload_sessions.load(session_id) if session_id else None
+    if existing is not None:
+        file_id = existing["id"]
+        file_key = crypto.unwrap_file_key(
+            master_key, existing["crypto"]["wrapped_file_key"]
+        )
+        if size is None:
+            size = existing.get("size")
+        shard_size = int(existing["chunk_size"])
+        dir_path = existing.get("path") or dir_path
+        filename = existing.get("filename") or filename
+        shard_records = {int(s["i"]): s for s in existing.get("shards", [])}
+        remote_folders = dict(existing.get("remote_folders") or {})
+        existing["status"] = "active"
+        existing["error"] = None
+        upload_sessions.save(existing)
+    else:
+        file_id = session_id or f"f_{secrets.token_hex(8)}"
+        file_key = crypto.new_file_key()
+        shard_records = {}
+        remote_folders = {}
+        upload_sessions.save(
+            {
+                "version": 1,
+                "id": file_id,
+                "status": "active",
+                "path": _normalize_dir(dir_path),
+                "filename": filename,
+                "size": size,
+                "chunk_size": shard_size,
+                "crypto": {
+                    "alg": crypto.ALG_CHUNK,
+                    "wrapped_file_key": crypto.wrap_file_key(master_key, file_key),
+                },
+                "remote_folders": {},
+                "shards": [],
+                "error": None,
+            }
+        )
+
+    start_chunk = resume_from_byte // shard_size if resume_from_byte else 0
+
     if size is not None and size >= 0:
-        expected_chunks = max(1, (size + CHUNK_SIZE - 1) // CHUNK_SIZE) if size > 0 else 1
+        expected_chunks = max(1, (size + shard_size - 1) // shard_size) if size > 0 else 1
         total_steps = max(1, size) + 1
         # Plaintext plus one GCM tag per chunk.
         estimated_cipher = size + cipher_size(0) * expected_chunks
         placeable = planner.placeable_total()
-        if placeable is not None and estimated_cipher > placeable:
+        if placeable is not None and estimated_cipher > placeable and existing is None:
             ratio_pct = int(round(STORAGE_FULL_RATIO * 100))
             raise ValueError(
                 f"Not enough free space under the {ratio_pct}% full threshold "
@@ -228,112 +360,561 @@ def upload_file(
         expected_chunks = None
         total_steps = 1
 
-    _progress(on_progress, "upload_shard", 0, total_steps, "Encrypting and uploading…")
-
-    shard_records: dict[int, dict[str, Any]] = {}
     done_bytes = 0
-    done_chunks = 0
+    if size is not None and size >= 0 and expected_chunks:
+        for i in sorted(shard_records):
+            if i < expected_chunks - 1:
+                done_bytes += shard_size
+            else:
+                done_bytes += max(0, size - i * shard_size)
+    else:
+        done_bytes = len(shard_records) * shard_size
+    done_chunks = len(shard_records)
+    # Per-account shards currently encrypting/uploading (not yet recorded as done).
+    inflight_by_account: dict[str, int] = {}
+
     progress_lock = threading.Lock()
-    workers = _worker_count(expected_chunks or SHARD_CONCURRENCY)
+    workers = _worker_count(expected_chunks or SHARD_UPLOAD_CONCURRENCY)
     in_flight: dict[Future[dict[str, Any]], int] = {}
-    uploaded_remote: list[tuple[str, str]] = []  # (account_id, remote_id) for cleanup
-    uploaded_lock = threading.Lock()
+    folders_lock = threading.Lock()
+    folder_create_locks: dict[str, threading.Lock] = {}
+    session_lock = threading.Lock()
+
+    def _persist_session(*, status: str | None = None, error: str | None = None) -> None:
+        with folders_lock:
+            folders_snapshot = dict(remote_folders)
+        with progress_lock:
+            shards_snapshot = [shard_records[i] for i in sorted(shard_records)]
+        with session_lock:
+            session = {
+                "version": 1,
+                "id": file_id,
+                "status": status or "active",
+                "path": _normalize_dir(dir_path),
+                "filename": filename,
+                "size": size,
+                "chunk_size": shard_size,
+                "crypto": {
+                    "alg": crypto.ALG_CHUNK,
+                    "wrapped_file_key": crypto.wrap_file_key(master_key, file_key),
+                },
+                "remote_folders": folders_snapshot,
+                "shards": shards_snapshot,
+                "error": error,
+            }
+            upload_sessions.save(session)
+
+    def _upload_stats() -> dict[str, Any]:
+        """Per-account shard/byte breakdown for the live progress UI.
+
+        Call under progress_lock after shard_records / done_bytes updates.
+        """
+        n_accounts = max(1, len(account_list))
+        finished = len(shard_records)
+        est_total = expected_chunks or max(finished, 1)
+        # Round-robin placement → roughly equal share per connected account.
+        estimated_each = (est_total + n_accounts - 1) // n_accounts
+        by_id: dict[str, dict[str, Any]] = {
+            a["id"]: {
+                "account_id": a["id"],
+                "provider": a["provider"],
+                "label": a.get("label") or a["id"],
+                "shards": 0,
+                "active": inflight_by_account.get(a["id"], 0),
+                "bytes": 0,
+                "estimated_shards": estimated_each,
+            }
+            for a in account_list
+        }
+        for idx, rec in shard_records.items():
+            aid = rec["account_id"]
+            bucket = by_id.get(aid)
+            if bucket is None:
+                continue
+            bucket["shards"] += 1
+            if size is not None and size >= 0 and expected_chunks:
+                if idx < expected_chunks - 1:
+                    bucket["bytes"] += shard_size
+                else:
+                    bucket["bytes"] += max(0, size - idx * shard_size)
+            else:
+                bucket["bytes"] += shard_size
+        return {
+            "done_shards": finished,
+            "expected_shards": expected_chunks,
+            "done_bytes": done_bytes,
+            "total_bytes": size,
+            "chunk_size": shard_size,
+            "active_shards": sum(inflight_by_account.values()),
+            "by_account": sorted(
+                by_id.values(),
+                key=lambda b: (b["provider"], b["label"]),
+            ),
+        }
+
+    _progress(
+        on_progress,
+        "upload_shard",
+        min(done_bytes, max(1, size or done_bytes or 1)),
+        total_steps,
+        f"Resuming… {done_chunks} shards already uploaded"
+        if done_chunks
+        else "Encrypting and uploading…",
+        stats=_upload_stats(),
+    )
 
     def _aborted() -> bool:
         return bool(should_abort and should_abort())
 
-    def _encrypt_upload(i: int, plain: bytes, account_id: str) -> dict[str, Any]:
+    def _cleanup_remote_folders() -> None:
+        with folders_lock:
+            folders = list(remote_folders.items())
+        for account_id, folder_id in folders:
+            try:
+                providers_by_id[account_id].delete(folder_id)
+                log.info(
+                    "upload cleanup deleted folder file=%s account=%s folder=%s",
+                    file_id,
+                    account_id,
+                    folder_id,
+                )
+            except Exception:
+                log.exception(
+                    "upload cleanup folder delete failed file=%s account=%s folder=%s",
+                    file_id,
+                    account_id,
+                    folder_id,
+                )
+        upload_sessions.delete(file_id)
+
+    def _folder_for(account_id: str) -> str:
+        with folders_lock:
+            existing_folder = remote_folders.get(account_id)
+            if existing_folder is not None:
+                return existing_folder
+            create_lock = folder_create_locks.setdefault(account_id, threading.Lock())
+        with create_lock:
+            with folders_lock:
+                existing_folder = remote_folders.get(account_id)
+                if existing_folder is not None:
+                    return existing_folder
+            folder_id = providers_by_id[account_id].ensure_file_folder(file_id)
+            with folders_lock:
+                remote_folders[account_id] = folder_id
+            _persist_session()
+            return folder_id
+
+    account_meta = {a["id"]: a for a in account_list}
+    # Cap in-flight ops per account (MEGA/Drive upload concurrency envs).
+    account_limits: dict[str, threading.Semaphore] = {}
+    for account in account_list:
+        limit = _provider_account_limit(account["provider"], workers=workers)
+        account_limits[account["id"]] = threading.Semaphore(limit)
+
+    def _encrypt_upload(
+        i: int,
+        plain: bytes,
+        account_id: str,
+        *,
+        release_slot: bool,
+    ) -> dict[str, Any]:
+        """Encrypt+upload one shard. Caller already holds account_limits[account_id]."""
         nonlocal done_bytes, done_chunks
-        if _aborted():
-            raise RuntimeError("Upload cancelled")
-        ciphertext, nonce = crypto.encrypt_chunk(file_key, plain)
-        remote_name = f"shard_{file_id}_{i}"
-        remote_id = providers_by_id[account_id].upload(remote_name, ciphertext)
-        with uploaded_lock:
-            uploaded_remote.append((account_id, remote_id))
-        if _aborted():
-            raise RuntimeError("Upload cancelled")
-        record = {
-            "i": i,
-            "account_id": account_id,
-            "remote_id": remote_id,
-            "sha256": hashlib.sha256(ciphertext).hexdigest(),
-            "nonce": crypto.b64e(nonce),
-        }
+        t0 = time.monotonic()
+        label = account_meta.get(account_id, {}).get("label") or account_id
+        provider = account_meta.get(account_id, {}).get("provider") or "?"
+        marked_active = True
+        try:
+            if _aborted():
+                raise RuntimeError("Upload cancelled")
+            ciphertext, nonce = crypto.encrypt_chunk(file_key, plain)
+            # Drop plaintext ref before network I/O so peak ≈ concurrency × shard.
+            plain_len = len(plain)
+            del plain
+            remote_name = f"shard_{file_id}_{i}"
+            cipher_len = len(ciphertext)
+            parent_id = _folder_for(account_id)
+            log.info(
+                "shard upload start file=%s i=%s%s plain=%s cipher=%s → %s:%s folder=%s",
+                file_id,
+                i + 1,
+                f"/{expected_chunks}" if expected_chunks else "",
+                plain_len,
+                cipher_len,
+                provider,
+                label,
+                parent_id,
+            )
+            try:
+                remote_id = providers_by_id[account_id].upload(
+                    remote_name,
+                    ciphertext,
+                    parent_id=parent_id,
+                )
+            except Exception:
+                log.exception(
+                    "shard upload failed file=%s i=%s → %s:%s elapsed=%.2fs",
+                    file_id,
+                    i + 1,
+                    provider,
+                    label,
+                    time.monotonic() - t0,
+                )
+                raise
+            if _aborted():
+                raise RuntimeError("Upload cancelled")
+            record = {
+                "i": i,
+                "account_id": account_id,
+                "remote_id": remote_id,
+                "sha256": hashlib.sha256(ciphertext).hexdigest(),
+                "nonce": crypto.b64e(nonce),
+            }
+            with progress_lock:
+                if marked_active:
+                    inflight_by_account[account_id] = max(
+                        0, inflight_by_account.get(account_id, 0) - 1
+                    )
+                    marked_active = False
+                shard_records[i] = record
+                done_chunks = len(shard_records)
+                done_bytes += plain_len
+                stats = _upload_stats()
+                if size is not None and size >= 0:
+                    current = min(done_bytes, max(1, size))
+                    msg = f"Uploaded chunk {done_chunks}" + (
+                        f"/{expected_chunks}" if expected_chunks else ""
+                    )
+                    _progress(
+                        on_progress,
+                        "upload_shard",
+                        current,
+                        total_steps,
+                        f"{msg}…",
+                        stats=stats,
+                    )
+                else:
+                    _progress(
+                        on_progress,
+                        "upload_shard",
+                        done_chunks,
+                        max(done_chunks + 1, total_steps),
+                        f"Uploaded chunk {done_chunks}…",
+                        stats=stats,
+                    )
+            _persist_session()
+            log.info(
+                "shard upload done file=%s i=%s%s remote_id=%s elapsed=%.2fs "
+                "done_chunks=%s done_bytes=%s",
+                file_id,
+                i + 1,
+                f"/{expected_chunks}" if expected_chunks else "",
+                remote_id,
+                time.monotonic() - t0,
+                done_chunks,
+                done_bytes,
+            )
+            return record
+        finally:
+            if marked_active:
+                with progress_lock:
+                    inflight_by_account[account_id] = max(
+                        0, inflight_by_account.get(account_id, 0) - 1
+                    )
+            account_limits[account_id].release()
+            if release_slot and on_chunk_done is not None:
+                on_chunk_done()
+
+    chunk_index = start_chunk
+    stream_bytes = 0
+    pool = ThreadPoolExecutor(max_workers=workers)
+    abort_exc: BaseException | None = None
+    chunk_iter = iter(chunks)
+    log.info(
+        "upload_file start file=%s path=%s filename=%s size=%s chunk_size=%s "
+        "workers=%s expected_chunks=%s resume_from_byte=%s done_shards=%s",
+        file_id,
+        dir_path,
+        filename,
+        size,
+        shard_size,
+        workers,
+        expected_chunks,
+        resume_from_byte,
+        len(shard_records),
+    )
+
+    def _reap_completed(*, block: bool = False, timeout: float = 0.05) -> int:
+        """Remove finished futures from ``in_flight``.
+
+        Critical: workers unmark ``active`` as soon as they finish, but until we
+        reap here ``len(in_flight)`` still counts them. Without continuous
+        reaping, the submit loop thinks the pool is full and cannot hand the
+        next shard to the first free worker.
+        """
+        reaped = 0
+        while in_flight:
+            if _aborted():
+                raise RuntimeError("Upload cancelled")
+            done, _ = wait(
+                in_flight,
+                timeout=(timeout if block else 0),
+                return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                return reaped
+            for fut in done:
+                i = in_flight.pop(fut)
+                shard_records[i] = fut.result()
+                reaped += 1
+            # After the first blocking wait, drain anything else already finished.
+            block = False
+            timeout = 0
+        return reaped
+
+    def _wait_one() -> None:
+        if not in_flight:
+            return
+        while not _reap_completed(block=True, timeout=0.5):
+            if _aborted():
+                raise RuntimeError("Upload cancelled")
+            if not in_flight:
+                return
+
+    def _claim_account(need: int) -> str:
+        """Acquire a per-account permit, then reserve placement on that account.
+
+        Permits are taken *before* submitting to the thread pool so MEGA's
+        concurrency=1 cannot park pool workers and starve Drive (or other)
+        accounts. If every account is at its cap, wait for an in-flight shard.
+        """
+        while True:
+            if _aborted():
+                raise RuntimeError("Upload cancelled")
+            _reap_completed()
+            available: list[str] = []
+            for account in account_list:
+                aid = account["id"]
+                if account_limits[aid].acquire(blocking=False):
+                    available.append(aid)
+            if not available:
+                if not in_flight:
+                    # No work running and no permits — should not happen; block.
+                    preferred = account_list[0]["id"]
+                    account_limits[preferred].acquire()
+                    available = [preferred]
+                else:
+                    _wait_one()
+                    continue
+            try:
+                chosen = planner.pick(need, only=set(available))
+            except ValueError:
+                for aid in available:
+                    account_limits[aid].release()
+                raise
+            for aid in available:
+                if aid != chosen:
+                    account_limits[aid].release()
+            return chosen
+
+    def _mark_active(account_id: str, chunk_i: int) -> None:
+        label = account_meta.get(account_id, {}).get("label") or account_id
+        provider = account_meta.get(account_id, {}).get("provider") or "?"
         with progress_lock:
-            done_chunks += 1
-            done_bytes += len(plain)
+            inflight_by_account[account_id] = inflight_by_account.get(account_id, 0) + 1
+            current = done_bytes
             if size is not None and size >= 0:
                 current = min(done_bytes, max(1, size))
-                msg = f"Uploaded chunk {done_chunks}" + (
-                    f"/{expected_chunks}" if expected_chunks else ""
-                )
-                _progress(on_progress, "upload_shard", current, total_steps, f"{msg}…")
-            else:
-                _progress(
-                    on_progress,
-                    "upload_shard",
-                    done_chunks,
-                    max(done_chunks + 1, total_steps),
-                    f"Uploaded chunk {done_chunks}…",
-                )
-        return record
+            _progress(
+                on_progress,
+                "upload_shard",
+                current,
+                total_steps,
+                f"Uploading chunk {chunk_i + 1}"
+                + (f"/{expected_chunks}" if expected_chunks else "")
+                + f" → {provider}:{label}…",
+                stats=_upload_stats(),
+            )
 
-    chunk_index = 0
-    plaintext_size = 0
+    # Feeder pulls plaintext in a side thread so the submit loop can keep
+    # reaping finished workers (first-finished → next job) instead of blocking
+    # inside next(chunk_iter) while in_flight fills with zombie done futures.
+    _CHUNK_END = object()
+    pending_chunks: queue.Queue[Any] = queue.Queue(maxsize=max(2, workers))
+    feeder_error: list[BaseException] = []
+
+    def _chunk_feeder() -> None:
+        try:
+            for plain in chunk_iter:
+                if _aborted():
+                    break
+                pending_chunks.put(plain)
+            pending_chunks.put(_CHUNK_END)
+        except BaseException as exc:
+            feeder_error.append(exc)
+            try:
+                pending_chunks.put(_CHUNK_END)
+            except Exception:
+                pass
+
+    feeder_thread = threading.Thread(
+        target=_chunk_feeder,
+        name=f"upload-feeder-{file_id}",
+        daemon=True,
+    )
+    feeder_thread.start()
 
     try:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            for plain in chunks:
+        try:
+            while True:
                 if _aborted():
                     raise RuntimeError("Upload cancelled")
-                plaintext_size += len(plain)
-                account_id = planner.pick(cipher_size(len(plain)))
-
+                # Drop finished futures so free workers can take new shards.
+                _reap_completed()
                 while len(in_flight) >= workers:
-                    fut = next(as_completed(in_flight))
-                    i = in_flight.pop(fut)
-                    shard_records[i] = fut.result()
-                    if _aborted():
-                        raise RuntimeError("Upload cancelled")
+                    _wait_one()
 
-                fut = pool.submit(_encrypt_upload, chunk_index, plain, account_id)
+                try:
+                    item = pending_chunks.get(timeout=0.05)
+                except queue.Empty:
+                    if feeder_error:
+                        raise feeder_error[0]
+                    # No plaintext yet — keep reaping so active/in_flight stay honest.
+                    continue
+
+                if item is _CHUNK_END:
+                    if feeder_error:
+                        raise feeder_error[0]
+                    break
+
+                plain = item
+                release_slot = not (chunk_index == 0 and plain == b"" and start_chunk == 0)
+                stream_bytes += len(plain)
+
+                # Already on provider from a prior attempt: drop plaintext and continue.
+                if chunk_index in shard_records:
+                    if release_slot and on_chunk_done is not None:
+                        on_chunk_done()
+                    log.info(
+                        "shard upload skip file=%s i=%s%s (already uploaded)",
+                        file_id,
+                        chunk_index + 1,
+                        f"/{expected_chunks}" if expected_chunks else "",
+                    )
+                    chunk_index += 1
+                    continue
+
+                need = cipher_size(len(plain))
+                account_id = _claim_account(need)
+                _mark_active(account_id, chunk_index)
+                try:
+                    fut = pool.submit(
+                        _encrypt_upload,
+                        chunk_index,
+                        plain,
+                        account_id,
+                        release_slot=release_slot,
+                    )
+                except Exception:
+                    with progress_lock:
+                        inflight_by_account[account_id] = max(
+                            0, inflight_by_account.get(account_id, 0) - 1
+                        )
+                    account_limits[account_id].release()
+                    if release_slot and on_chunk_done is not None:
+                        on_chunk_done()
+                    raise
                 in_flight[fut] = chunk_index
                 chunk_index += 1
 
-            for fut in as_completed(list(in_flight.keys())):
-                i = in_flight.pop(fut)
-                shard_records[i] = fut.result()
-                if _aborted():
-                    raise RuntimeError("Upload cancelled")
-    except Exception:
-        for account_id, remote_id in list(uploaded_remote):
-            try:
-                providers_by_id[account_id].delete(remote_id)
-            except Exception:
-                pass
-        raise
+            while in_flight:
+                _wait_one()
+        except BaseException as exc:
+            abort_exc = exc
+    finally:
+        # Unblock feeder if it is sitting on a full pending queue.
+        try:
+            while True:
+                pending_chunks.get_nowait()
+        except queue.Empty:
+            pass
+        feeder_thread.join(timeout=5)
+        # Wait for in-flight uploads so folder delete cannot race late writes.
+        pool.shutdown(wait=True, cancel_futures=abort_exc is not None or _aborted())
+        # Only wipe remotes on explicit user cancel. Provider glitches / interrupts
+        # keep per-file folders so progress is not thrown away for a retryable error.
+        if _aborted():
+            _cleanup_remote_folders()
+        elif abort_exc is not None:
+            err = str(abort_exc) or type(abort_exc).__name__
+            _persist_session(status="failed", error=err)
+            log.warning(
+                "upload failed; session kept for resume file=%s done_shards=%s error=%s",
+                file_id,
+                len(shard_records),
+                abort_exc,
+            )
 
+    if abort_exc is not None:
+        raise abort_exc
     if _aborted():
         raise RuntimeError("Upload cancelled")
 
-    ordered = [shard_records[i] for i in range(chunk_index)]
+    plaintext_size = resume_from_byte + stream_bytes
+    # Full re-stream from 0: stream_bytes is the whole file; resume_from_byte is 0.
+    # Offset resume: stream covers the suffix only.
+    if size is not None and size >= 0 and plaintext_size != size:
+        # Incomplete body cannot be indexed; keep session for resume (not cancel).
+        _persist_session(
+            status="failed",
+            error=(
+                f"Upload truncated or oversized: received {plaintext_size} bytes, "
+                f"expected {size} bytes"
+            ),
+        )
+        raise ValueError(
+            f"Upload truncated or oversized: received {plaintext_size} bytes, "
+            f"expected {size} bytes"
+        )
+
+    if expected_chunks is not None:
+        missing = [i for i in range(expected_chunks) if i not in shard_records]
+        if missing:
+            _persist_session(status="failed", error=f"Missing shards: {missing[:8]}")
+            raise RuntimeError(
+                f"Upload incomplete: missing {len(missing)} shards (e.g. {missing[:5]})"
+            )
+        ordered = [shard_records[i] for i in range(expected_chunks)]
+    else:
+        ordered = [shard_records[i] for i in range(chunk_index)]
+
     if size is not None and size >= 0:
         total_steps = max(1, size) + 1
+        final_size = size
     else:
-        total_steps = plaintext_size + 1 if plaintext_size > 0 else 2
+        final_size = plaintext_size
+        total_steps = final_size + 1 if final_size > 0 else 2
 
     _progress(on_progress, "index", total_steps - 1, total_steps, "Updating vault index…")
+    log.info(
+        "upload_file indexing file=%s shards=%s plaintext=%s",
+        file_id,
+        len(ordered),
+        final_size,
+    )
+    with folders_lock:
+        folders_snapshot = dict(remote_folders)
     entry = {
         "id": file_id,
         "path": _join_path(dir_path, filename),
-        "size": plaintext_size,
+        "size": final_size,
         "mtime": int(time.time()),
-        "chunk_size": CHUNK_SIZE,
+        "chunk_size": shard_size,
         "crypto": {
             "alg": crypto.ALG_CHUNK,
             "wrapped_file_key": crypto.wrap_file_key(master_key, file_key),
         },
+        "remote_folders": folders_snapshot,
         "shards": ordered,
     }
 
@@ -341,7 +922,15 @@ def upload_file(
     index["files"] = [f for f in index.get("files", []) if f["path"] != entry["path"]]
     vault_index.upsert_file(index, entry)
     vault_index.save_index(index)
+    upload_sessions.delete(file_id)
     _progress(on_progress, "done", total_steps, total_steps, "Done")
+    log.info(
+        "upload_file complete file=%s path=%s size=%s shards=%s",
+        file_id,
+        entry["path"],
+        final_size,
+        len(ordered),
+    )
     return entry
 
 
@@ -352,14 +941,17 @@ def upload_file_from_stream(
     source: BinaryIO,
     *,
     size: int | None = None,
+    chunk_size: int | None = None,
     on_progress: ProgressFn | None = None,
 ) -> dict[str, Any]:
+    shard_size = chunk_size if chunk_size is not None else choose_chunk_size(size)
     return upload_file(
         master_key,
         dir_path,
         filename,
-        _iter_plaintext_chunks(source),
+        _iter_plaintext_chunks(source, shard_size),
         size=size,
+        chunk_size=shard_size,
         on_progress=on_progress,
     )
 
@@ -391,9 +983,16 @@ def iter_download(
     master_key: bytes,
     file_id: str,
     on_progress: ProgressFn | None = None,
+    *,
+    should_abort: Callable[[], bool] | None = None,
 ) -> Any:
     """Yield plaintext chunks while fetching/decrypting with bounded buffers."""
-    for _name, chunk in _iter_download_named(master_key, file_id, on_progress):
+    for _name, chunk in _iter_download_named(
+        master_key,
+        file_id,
+        on_progress,
+        should_abort=should_abort,
+    ):
         yield chunk
 
 
@@ -401,6 +1000,8 @@ def _iter_download_named(
     master_key: bytes,
     file_id: str,
     on_progress: ProgressFn | None = None,
+    *,
+    should_abort: Callable[[], bool] | None = None,
 ) -> Any:
     index = vault_index.load_index()
     entry = vault_index.find_file(index, file_id)
@@ -418,82 +1019,231 @@ def _iter_download_named(
     total_steps = max(1, len(shard_list))
     name = PurePosixPath(entry["path"]).name
     file_key = crypto.unwrap_file_key(master_key, entry["crypto"]["wrapped_file_key"])
+    file_size = entry.get("size")
+    chunk_size = int(entry.get("chunk_size") or 0) or None
 
     yield from _iter_chunked_named(
         name,
         shard_list,
+        account_list,
         account_map,
         providers_by_id,
         file_key,
         total_steps,
         on_progress,
+        total_bytes=file_size if isinstance(file_size, int) else None,
+        chunk_size=chunk_size,
+        should_abort=should_abort,
     )
 
 
 def _iter_chunked_named(
     name: str,
     shard_list: list[dict[str, Any]],
+    account_list: list[dict[str, Any]],
     account_map: dict[str, Any],
     providers_by_id: dict[str, Any],
     file_key: bytes,
     total_steps: int,
     on_progress: ProgressFn | None,
+    *,
+    total_bytes: int | None = None,
+    chunk_size: int | None = None,
+    should_abort: Callable[[], bool] | None = None,
 ) -> Any:
     if not shard_list:
         _progress(on_progress, "done", 1, 1, "Done")
         yield name, b""
         return
 
-    _progress(on_progress, "fetch_shard", 0, total_steps, "Fetching shards…")
-    workers = _worker_count(len(shard_list))
-    max_buffered = max(workers, DOWNLOAD_QUEUE_DEPTH)
-    done_count = 0
-    progress_lock = threading.Lock()
-
-    def _fetch(step: int, shard_rec: dict[str, Any]) -> tuple[int, bytes]:
-        nonlocal done_count
-        data = _fetch_shard(shard_rec, account_map, providers_by_id)
-        with progress_lock:
-            done_count += 1
-            _progress(
-                on_progress,
-                "fetch_shard",
-                done_count,
-                total_steps,
-                f"Fetched {done_count}/{len(shard_list)} shards…",
-            )
-        return step, data
+    def _aborted() -> bool:
+        return bool(should_abort and should_abort())
 
     n = len(shard_list)
-    next_submit = 0
+    workers = _worker_count(n, download=True)
+    max_buffered = max(workers, DOWNLOAD_QUEUE_DEPTH)
+    progress_lock = threading.Lock()
+    done_count = 0
+    done_bytes = 0
+    inflight_by_account: dict[str, int] = {}
+    done_by_account: dict[str, dict[str, int]] = {}
+    # Exact per-account share from the vault index (not an estimate).
+    expected_by_account: dict[str, int] = {}
+    for shard_rec in shard_list:
+        aid = shard_rec["account_id"]
+        expected_by_account[aid] = expected_by_account.get(aid, 0) + 1
+        done_by_account.setdefault(aid, {"shards": 0, "bytes": 0})
+
+    account_limits: dict[str, threading.Semaphore] = {}
+    for account in account_list:
+        limit = _provider_account_limit(
+            account["provider"], workers=workers, download=True
+        )
+        account_limits[account["id"]] = threading.Semaphore(limit)
+    # Shards may reference accounts removed from the store; still allow one slot.
+    for aid in expected_by_account:
+        account_limits.setdefault(aid, threading.Semaphore(1))
+
+    def _download_stats() -> dict[str, Any]:
+        by_id: dict[str, dict[str, Any]] = {}
+        for aid, expected in expected_by_account.items():
+            meta = account_map.get(aid) or {}
+            done = done_by_account.get(aid) or {"shards": 0, "bytes": 0}
+            by_id[aid] = {
+                "account_id": aid,
+                "provider": meta.get("provider") or "?",
+                "label": meta.get("label") or aid,
+                "shards": done["shards"],
+                "active": inflight_by_account.get(aid, 0),
+                "bytes": done["bytes"],
+                "estimated_shards": expected,
+            }
+        return {
+            "done_shards": done_count,
+            "expected_shards": n,
+            "done_bytes": done_bytes,
+            "total_bytes": total_bytes,
+            "chunk_size": chunk_size or 0,
+            "active_shards": sum(inflight_by_account.values()),
+            "by_account": sorted(
+                by_id.values(),
+                key=lambda b: (b["provider"], b["label"]),
+            ),
+        }
+
+    def _emit(message: str) -> None:
+        _progress(
+            on_progress,
+            "fetch_shard",
+            done_count,
+            total_steps,
+            message,
+            stats=_download_stats(),
+        )
+
+    _emit("Fetching shards…")
+
+    def _fetch(step: int, shard_rec: dict[str, Any]) -> tuple[int, bytes, str, int]:
+        account_id = shard_rec["account_id"]
+        try:
+            if _aborted():
+                raise DownloadCancelled("Download cancelled")
+            data = _fetch_shard(shard_rec, account_map, providers_by_id)
+            if _aborted():
+                raise DownloadCancelled("Download cancelled")
+            return step, data, account_id, len(data)
+        finally:
+            account_limits[account_id].release()
+
+    submitted: set[int] = set()
     next_yield = 0
-    in_flight: dict[Future[tuple[int, bytes]], int] = {}
+    in_flight: dict[Future[tuple[int, bytes, str, int]], int] = {}
     ready: dict[int, bytes] = {}
+    pool = ThreadPoolExecutor(max_workers=workers)
+    cancelled = False
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        while next_yield < n:
-            while next_submit < n and (len(in_flight) + len(ready)) < max_buffered:
-                fut = pool.submit(_fetch, next_submit, shard_list[next_submit])
-                in_flight[fut] = next_submit
-                next_submit += 1
-
-            if not in_flight and next_yield not in ready:
-                break
-
-            if in_flight:
-                fut = next(as_completed(in_flight))
+    def _reap_completed(*, block: bool = False, timeout: float = 0.05) -> int:
+        nonlocal done_count, done_bytes
+        reaped = 0
+        while in_flight:
+            done, _ = wait(
+                in_flight,
+                timeout=(timeout if block else 0),
+                return_when=FIRST_COMPLETED,
+            )
+            if not done:
+                return reaped
+            for fut in done:
                 step = in_flight.pop(fut)
-                _step, data = fut.result()
+                _step, data, account_id, nbytes = fut.result()
                 ready[step] = data
+                with progress_lock:
+                    inflight_by_account[account_id] = max(
+                        0, inflight_by_account.get(account_id, 0) - 1
+                    )
+                    done_count += 1
+                    done_bytes += nbytes
+                    bucket = done_by_account.setdefault(
+                        account_id, {"shards": 0, "bytes": 0}
+                    )
+                    bucket["shards"] += 1
+                    bucket["bytes"] += nbytes
+                    _emit(f"Fetched {done_count}/{n} shards…")
+                reaped += 1
+            block = False
+            timeout = 0
+        return reaped
+
+    def _try_submit() -> bool:
+        """Submit the lowest-index ready shard whose account has capacity."""
+        if _aborted() or cancelled:
+            return False
+        if len(in_flight) >= workers:
+            return False
+        if (len(in_flight) + len(ready)) >= max_buffered:
+            return False
+        for i in range(n):
+            if i in submitted:
+                continue
+            account_id = shard_list[i]["account_id"]
+            if not account_limits[account_id].acquire(blocking=False):
+                continue
+            submitted.add(i)
+            with progress_lock:
+                inflight_by_account[account_id] = (
+                    inflight_by_account.get(account_id, 0) + 1
+                )
+                _emit(f"Fetching shard {i + 1}/{n}…")
+            fut = pool.submit(_fetch, i, shard_list[i])
+            in_flight[fut] = i
+            return True
+        return False
+
+    try:
+        while next_yield < n:
+            if _aborted():
+                cancelled = True
+                raise DownloadCancelled("Download cancelled")
+            _reap_completed()
+            while _try_submit():
+                pass
 
             while next_yield in ready:
+                if _aborted():
+                    cancelled = True
+                    raise DownloadCancelled("Download cancelled")
                 cipher = ready.pop(next_yield)
                 nonce = crypto.b64d(shard_list[next_yield]["nonce"])
                 plain = crypto.decrypt_chunk(file_key, cipher, nonce)
                 yield name, plain
                 next_yield += 1
+                # Free buffer slots → immediately hand work to free workers.
+                while _try_submit():
+                    pass
 
-    _progress(on_progress, "done", total_steps, total_steps, "Done")
+            if next_yield >= n:
+                break
+            if in_flight:
+                _reap_completed(block=True, timeout=0.5)
+                continue
+            if next_yield not in ready:
+                raise RuntimeError(
+                    f"Download stalled: waiting for shard {next_yield} with nothing in flight"
+                )
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+    if cancelled or _aborted():
+        raise DownloadCancelled("Download cancelled")
+
+    _progress(
+        on_progress,
+        "done",
+        total_steps,
+        total_steps,
+        "Done",
+        stats=_download_stats(),
+    )
 
 
 def _fetch_shard(
@@ -518,37 +1268,70 @@ def delete_file(file_id: str, on_progress: ProgressFn | None = None) -> None:
         raise FileNotFoundError("File not found")
 
     shard_list = entry.get("shards", [])
-    total_steps = len(shard_list) + 1  # shards + index
+    remote_folders = entry.get("remote_folders") or {}
     account_list = accounts_store.load_accounts()
     account_map = {a["id"]: a for a in account_list}
-    providers_by_id = _providers_by_id(
-        [a for a in account_list if any(s["account_id"] == a["id"] for s in shard_list)]
-    )
+    needed_ids = set(remote_folders) | {s["account_id"] for s in shard_list}
+    providers_by_id = _providers_by_id([a for a in account_list if a["id"] in needed_ids])
     done_count = 0
     progress_lock = threading.Lock()
 
-    def _delete_one(shard_rec: dict[str, Any]) -> None:
-        nonlocal done_count
-        account = account_map.get(shard_rec["account_id"])
-        if account is not None:
+    if remote_folders:
+        # One folder delete per account removes all shards for this file.
+        folder_items = [
+            (account_id, folder_id)
+            for account_id, folder_id in remote_folders.items()
+            if account_id in providers_by_id
+        ]
+        total_steps = len(folder_items) + 1
+
+        def _delete_folder(item: tuple[str, str]) -> None:
+            nonlocal done_count
+            account_id, folder_id = item
             try:
-                providers_by_id[account["id"]].delete(shard_rec["remote_id"])
+                providers_by_id[account_id].delete(folder_id)
             except Exception:
                 pass
-        with progress_lock:
-            done_count += 1
-            _progress(
-                on_progress,
-                "delete_shard",
-                done_count,
-                total_steps,
-                f"Deleted {done_count}/{len(shard_list)} shards…",
-            )
+            with progress_lock:
+                done_count += 1
+                _progress(
+                    on_progress,
+                    "delete_shard",
+                    done_count,
+                    total_steps,
+                    f"Deleted remote folder {done_count}/{len(folder_items)}…",
+                )
 
-    if shard_list:
-        _progress(on_progress, "delete_shard", 0, total_steps, "Deleting shards…")
-        with ThreadPoolExecutor(max_workers=_worker_count(len(shard_list))) as pool:
-            list(pool.map(_delete_one, shard_list))
+        if folder_items:
+            _progress(on_progress, "delete_shard", 0, total_steps, "Deleting remote folders…")
+            with ThreadPoolExecutor(max_workers=_worker_count(len(folder_items))) as pool:
+                list(pool.map(_delete_folder, folder_items))
+    else:
+        # Legacy entries without per-file folders: delete shards one by one.
+        total_steps = len(shard_list) + 1
+
+        def _delete_one(shard_rec: dict[str, Any]) -> None:
+            nonlocal done_count
+            account = account_map.get(shard_rec["account_id"])
+            if account is not None:
+                try:
+                    providers_by_id[account["id"]].delete(shard_rec["remote_id"])
+                except Exception:
+                    pass
+            with progress_lock:
+                done_count += 1
+                _progress(
+                    on_progress,
+                    "delete_shard",
+                    done_count,
+                    total_steps,
+                    f"Deleted {done_count}/{len(shard_list)} shards…",
+                )
+
+        if shard_list:
+            _progress(on_progress, "delete_shard", 0, total_steps, "Deleting shards…")
+            with ThreadPoolExecutor(max_workers=_worker_count(len(shard_list))) as pool:
+                list(pool.map(_delete_one, shard_list))
 
     _progress(on_progress, "index", total_steps - 1, total_steps, "Updating vault index…")
     vault_index.save_index(index)

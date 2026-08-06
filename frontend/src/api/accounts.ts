@@ -1,3 +1,5 @@
+import { apiUrl } from './base'
+
 export type Account = {
   id: string
   provider: 'gdrive' | 'mega'
@@ -40,19 +42,19 @@ async function readError(res: Response): Promise<string> {
 }
 
 export async function listAccounts(): Promise<Account[]> {
-  const res = await fetch('/api/accounts', { credentials: 'include' })
+  const res = await fetch(apiUrl('/api/accounts'), { credentials: 'include' })
   if (!res.ok) throw new Error(await readError(res))
   return res.json() as Promise<Account[]>
 }
 
 export async function getStorageStats(): Promise<StorageStats> {
-  const res = await fetch('/api/accounts/storage', { credentials: 'include' })
+  const res = await fetch(apiUrl('/api/accounts/storage'), { credentials: 'include' })
   if (!res.ok) throw new Error(await readError(res))
   return res.json() as Promise<StorageStats>
 }
 
 export async function deleteAccount(id: string): Promise<void> {
-  const res = await fetch(`/api/accounts/${encodeURIComponent(id)}`, {
+  const res = await fetch(apiUrl(`/api/accounts/${encodeURIComponent(id)}`), {
     method: 'DELETE',
     credentials: 'include',
   })
@@ -64,7 +66,7 @@ export async function connectMega(
   password: string,
   mfa?: string,
 ): Promise<Account> {
-  const res = await fetch('/api/auth/mega', {
+  const res = await fetch(apiUrl('/api/auth/mega'), {
     method: 'POST',
     credentials: 'include',
     headers: { 'Content-Type': 'application/json' },
@@ -79,5 +81,5 @@ export async function connectMega(
 }
 
 export function startGoogleOAuth(): void {
-  window.location.href = '/api/auth/google/start'
+  window.location.href = apiUrl('/api/auth/google/start')
 }

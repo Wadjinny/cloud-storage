@@ -20,6 +20,8 @@ class Job:
     error: str | None = None
     result_meta: dict[str, Any] | None = None
     result_name: str | None = None
+    # Live transfer breakdown (e.g. per-account upload shard counts).
+    stats: dict[str, Any] | None = None
     cancel_requested: bool = False
     created_at: float = field(default_factory=time.time)
 
@@ -41,6 +43,7 @@ class Job:
             "error": self.error,
             "result": self.result_meta,
             "filename": self.result_name,
+            "stats": self.stats,
             "cancel_requested": self.cancel_requested,
         }
 
@@ -71,6 +74,7 @@ class JobStore:
         message: str | None = None,
         current: int | None = None,
         total: int | None = None,
+        stats: dict[str, Any] | None = None,
     ) -> None:
         with self._lock:
             job = self._jobs.get(job_id)
@@ -84,6 +88,8 @@ class JobStore:
                 job.current = current
             if total is not None:
                 job.total = total
+            if stats is not None:
+                job.stats = stats
         self._notify(job_id)
 
     def complete(
@@ -107,7 +113,13 @@ class JobStore:
             job.result_name = result_name
         self._notify(job_id)
 
-    def fail(self, job_id: str, error: str) -> None:
+    def fail(
+        self,
+        job_id: str,
+        error: str,
+        *,
+        result_meta: dict[str, Any] | None = None,
+    ) -> None:
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
@@ -118,6 +130,8 @@ class JobStore:
             job.phase = "error"
             job.message = error
             job.error = error
+            if result_meta is not None:
+                job.result_meta = result_meta
         self._notify(job_id)
 
     def request_cancel(self, job_id: str, message: str = "Cancelled") -> bool:

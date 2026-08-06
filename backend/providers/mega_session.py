@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 from collections.abc import Awaitable, Callable
@@ -8,11 +9,19 @@ from typing import TypeVar
 
 from mega.client import MegaNzClient
 
-from config import MEGA_ACCOUNT_CONCURRENCY, MEGA_SESSION_TTL_SECONDS, SHARD_FOLDER_NAME
+from config import (
+    MEGA_ACCOUNT_UPLOAD_CONCURRENCY,
+    MEGA_ACCOUNT_DOWNLOAD_CONCURRENCY,
+    MEGA_SESSION_TTL_SECONDS,
+    PROVIDER_OP_TIMEOUT,
+    SHARD_FOLDER_NAME,
+)
 from providers.mega_auth import mega_login
 
 T = TypeVar("T")
 CoroFn = Callable[[MegaNzClient], Awaitable[T]]
+
+log = logging.getLogger(__name__)
 
 
 class MegaAccountSession:
@@ -26,7 +35,12 @@ class MegaAccountSession:
         self._email = email
         self._password = password
         self._mfa = mfa
-        self._pool_size = max(1, MEGA_ACCOUNT_CONCURRENCY)
+        # Pool must cover both upload and download per-account caps.
+        self._pool_size = max(
+            1,
+            MEGA_ACCOUNT_UPLOAD_CONCURRENCY,
+            MEGA_ACCOUNT_DOWNLOAD_CONCURRENCY,
+        )
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
@@ -119,6 +133,24 @@ class MegaAccountSession:
             self._folder_id = folder.id
             return self._folder_id
 
+    async def _ensure_file_folder(self, client: MegaNzClient, file_id: str) -> str:
+        """Create a per-file folder under the vault root (idempotent).
+
+        mega.py's ``create_folder`` accepts POSIX paths for lookup, but ``mkdir``
+        takes a single segment name (``/`` is illegal). So we resolve/create the
+        vault root, then mkdir ``file_id`` under that parent.
+        """
+        parent_id = await self._ensure_folder(client)
+        path = f"{SHARD_FOLDER_NAME}/{file_id}"
+        try:
+            existing = await client.find(path)
+            if existing.is_folder:
+                return existing.id
+        except FileNotFoundError:
+            pass
+        folder = await client._core.mkdir(file_id, parent_id)
+        return folder.id
+
     async def _run_op(self, op: CoroFn[T]) -> T:
         client = await self._acquire()
         self._last_used = time.time()
@@ -135,7 +167,19 @@ class MegaAccountSession:
         if self._closed or self._loop is None:
             raise RuntimeError("MEGA session is closed")
         future = asyncio.run_coroutine_threadsafe(self._run_op(op), self._loop)
-        return future.result()
+        # Bound cloud ops so a stuck MEGA call cannot freeze upload/download forever.
+        try:
+            return future.result(timeout=PROVIDER_OP_TIMEOUT)
+        except TimeoutError as exc:
+            log.error(
+                "mega op timed out after %ss email=%s",
+                PROVIDER_OP_TIMEOUT,
+                self._email,
+            )
+            future.cancel()
+            raise TimeoutError(
+                f"MEGA operation timed out after {PROVIDER_OP_TIMEOUT}s"
+            ) from exc
 
     @property
     def idle_seconds(self) -> float:

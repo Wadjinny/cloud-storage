@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,8 @@ from providers.mega_session import mega_sessions
 # Re-export for routes that import verify from providers.mega
 __all__ = ["MegaProvider", "verify_mega_login", "mega_login"]
 
+log = logging.getLogger(__name__)
+
 
 class MegaProvider:
     def __init__(self, credentials: dict[str, Any]) -> None:
@@ -22,18 +26,60 @@ class MegaProvider:
     def _session(self):
         return mega_sessions.get(self._email, self._password, self._mfa)
 
-    def upload(self, remote_id: str, data: bytes) -> str:
+    def ensure_file_folder(self, file_id: str) -> str:
+        """Per-upload folder under the vault root (cancel deletes this in one call)."""
         session = self._session()
 
+        async def _ensure(client: MegaNzClient) -> str:
+            return await session._ensure_file_folder(client, file_id)
+
+        return session.run(_ensure)
+
+    def upload(self, remote_id: str, data: bytes, *, parent_id: str | None = None) -> str:
+        session = self._session()
+        log.info("mega upload start name=%s bytes=%s email=%s", remote_id, len(data), self._email)
+        t0 = time.monotonic()
+
         async def _upload(client: MegaNzClient) -> str:
-            folder_id = await session._ensure_folder(client)
+            folder_id = (
+                parent_id if parent_id is not None else await session._ensure_folder(client)
+            )
             with tempfile.TemporaryDirectory() as tmp:
                 path = Path(tmp) / remote_id
                 path.write_bytes(data)
                 node = await client.upload(path, dest_node_id=folder_id)
                 return node.id
 
-        return session.run(_upload)
+        try:
+            node_id = session.run(_upload)
+        except TimeoutError:
+            log.error(
+                "mega upload timed out name=%s bytes=%s elapsed=%.2fs email=%s",
+                remote_id,
+                len(data),
+                time.monotonic() - t0,
+                self._email,
+            )
+            mega_sessions.drop(self._email)
+            raise
+        except Exception:
+            log.exception(
+                "mega upload failed name=%s bytes=%s elapsed=%.2fs email=%s",
+                remote_id,
+                len(data),
+                time.monotonic() - t0,
+                self._email,
+            )
+            raise
+        log.info(
+            "mega upload done name=%s id=%s bytes=%s elapsed=%.2fs email=%s",
+            remote_id,
+            node_id,
+            len(data),
+            time.monotonic() - t0,
+            self._email,
+        )
+        return node_id
 
     def download(self, remote_id: str) -> bytes:
         session = self._session()
