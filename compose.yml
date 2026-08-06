@@ -1,0 +1,16 @@
+services:
+  backend:
+    image: ghcr.io/wadjinny/cloud-storage/backend:${IMAGE_TAG:-latest}
+    ports:
+      - "1234:1234"
+    restart: unless-stopped
+    mem_limit: 512m
+    environment:
+      SESSION_SECRET: ${SESSION_SECRET:-change-me}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-https://cloud-storage.w-ilyas.site/api/auth/google/callback}
+      FRONTEND_URL: ${FRONTEND_URL:-https://cloud-storage.w-ilyas.site}
+      DATA_DIR: /data
+    volumes:
+      - ./data:/data

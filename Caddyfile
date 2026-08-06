@@ -1,0 +1,14 @@
+cloud-storage.w-ilyas.site {
+	encode gzip
+	handle /api/* {
+		reverse_proxy localhost:1234
+	}
+	handle /health {
+		reverse_proxy localhost:1234
+	}
+	handle {
+		root * /home/ubuntu/thinkering/cloud-storage
+		try_files {path} /index.html
+		file_server
+	}
+}

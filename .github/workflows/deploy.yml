@@ -1,0 +1,39 @@
+name: Deploy backend and frontend CI/CD
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    uses: Wadjinny/workflows/.github/workflows/docker-build-push.yml@main
+    with:
+      context: ./backend
+      image_name: wadjinny/cloud-storage/backend
+
+  deploy:
+    needs: build
+    uses: Wadjinny/workflows/.github/workflows/docker-deploy-ssh.yml@main
+    with:
+      image_tag: ${{ needs.build.outputs.tag }}
+      remote_dir: /home/ubuntu/apps/cloud-storage
+    secrets: inherit
+
+  frontend:
+    uses: Wadjinny/workflows/.github/workflows/deploy-pnpm-vite.yml@main
+    with:
+      VITE_PROJECT_DIR: frontend
+    secrets: inherit
+
+  caddy:
+    needs: [deploy, frontend]
+    uses: Wadjinny/workflows/.github/workflows/deploy-caddy-site.yml@main
+    with:
+      caddy_file: Caddyfile
+      remote_file: /etc/caddy/sites/cloud-storage.conf
+    secrets: inherit
