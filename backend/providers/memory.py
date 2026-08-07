@@ -9,8 +9,12 @@ from typing import Any
 class MemoryProvider:
     """Test blob store. In-process by default; set credentials disk_root for on-disk."""
 
+    VAULT_ROOT_ID = "dir_vault_root"
+
     _store: dict[str, bytes] = {}
     _folders: dict[str, set[str]] = {}
+    # folder_id → display name (for vault-root children listing)
+    _folder_names: dict[str, str] = {}
     _lock = threading.Lock()
     _used = 0
     # Large enough that 1 GiB uploads stay under STORAGE_FULL_RATIO headroom.
@@ -25,19 +29,48 @@ class MemoryProvider:
         self._unlink_after_read = bool(creds.get("unlink_after_read"))
         if self._disk_root is not None:
             self._disk_root.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            self._folders.setdefault(self.VAULT_ROOT_ID, set())
 
     @classmethod
     def reset(cls) -> None:
         with cls._lock:
             cls._store.clear()
             cls._folders.clear()
+            cls._folder_names.clear()
             cls._used = 0
+            cls._folders.setdefault(cls.VAULT_ROOT_ID, set())
 
     def ensure_file_folder(self, file_id: str) -> str:
         folder_id = f"dir_{file_id}"
         with self._lock:
+            self._folders.setdefault(self.VAULT_ROOT_ID, set()).add(folder_id)
             self._folders.setdefault(folder_id, set())
+            self._folder_names[folder_id] = file_id
         return folder_id
+
+    def list_vault_children(self) -> list[dict[str, str]]:
+        with self._lock:
+            child_ids = list(self._folders.get(self.VAULT_ROOT_ID, set()))
+            out: list[dict[str, str]] = []
+            for child_id in child_ids:
+                if child_id in self._folders:
+                    out.append(
+                        {
+                            "id": child_id,
+                            "name": self._folder_names.get(child_id, child_id),
+                            "kind": "folder",
+                        }
+                    )
+                else:
+                    out.append(
+                        {
+                            "id": child_id,
+                            "name": child_id,
+                            "kind": "file",
+                        }
+                    )
+            return out
 
     def upload(self, remote_id: str, data: bytes, *, parent_id: str | None = None) -> str:
         key = remote_id or f"mem_{secrets.token_hex(8)}"
@@ -82,9 +115,21 @@ class MemoryProvider:
             raise FileNotFoundError(f"Missing shard {remote_id}")
         return data
 
+    def exists(self, remote_id: str) -> bool:
+        if self._disk_root is not None:
+            if (self._disk_root / remote_id).exists():
+                return True
+            with self._lock:
+                return remote_id in self._folders
+        with self._lock:
+            return remote_id in self._store or remote_id in self._folders
+
     def delete(self, remote_id: str) -> None:
         with self._lock:
             children = self._folders.pop(remote_id, None)
+            self._folder_names.pop(remote_id, None)
+            for folder_children in self._folders.values():
+                folder_children.discard(remote_id)
         if children is not None:
             for child in list(children):
                 self.delete(child)

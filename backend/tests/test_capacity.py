@@ -9,6 +9,8 @@ from services.capacity import (
     cipher_size,
     headroom_bytes,
     is_full,
+    reset_placement_stripes,
+    shard_balance_cap,
 )
 
 
@@ -47,6 +49,28 @@ def test_placement_round_robin() -> None:
     assert planner.pick(10) == "a"
     assert planner.pick(10) == "b"
     assert planner.pick(10) == "a"
+
+
+def test_placement_stripe_shared_across_planners() -> None:
+    """Concurrent small-file jobs must share the round-robin cursor per user."""
+    reset_placement_stripes()
+    quotas = [
+        AccountQuota(account_id="a", used=0, total=1000),
+        AccountQuota(account_id="b", used=0, total=1000),
+        AccountQuota(account_id="c", used=0, total=1000),
+    ]
+    # Each planner mimics one single-shard file upload.
+    picks = [
+        PlacementPlanner(quotas=list(quotas), user_id="usr_stripe").pick(10)
+        for _ in range(6)
+    ]
+    assert picks == ["a", "b", "c", "a", "b", "c"]
+    # Without a user_id, each planner keeps a private cursor (legacy / tests).
+    alone = [
+        PlacementPlanner(quotas=list(quotas)).pick(10)
+        for _ in range(3)
+    ]
+    assert alone == ["a", "a", "a"]
 
 
 def test_placement_skips_full_accounts(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -90,3 +114,76 @@ def test_placeable_total_none_when_unknown() -> None:
         ]
     )
     assert planner.placeable_total() is None
+
+
+def test_shard_balance_cap_formula(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("services.capacity.SHARD_BALANCE_SLACK", 0.2)
+    # 100 / 4 * 1.2 = 30
+    assert shard_balance_cap(100, 4) == 30
+    # 10 / 3 * 1.2 ≈ 4
+    assert shard_balance_cap(10, 3) == 4
+    assert shard_balance_cap(1, 1) == 2  # ceil(1 * 1.2) = 2
+
+
+def test_placement_balance_skips_saturated_then_relaxes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("services.capacity.SHARD_BALANCE_SLACK", 0.0)
+    planner = PlacementPlanner(
+        quotas=[
+            AccountQuota(account_id="fast", used=0, total=10_000),
+            AccountQuota(account_id="slow", used=0, total=10_000),
+        ]
+    )
+    # Hard equal split: ceil(4/2)*1.0 = 2
+    assert planner.configure_balance(4) == 2
+
+    assert planner.pick(10) == "fast"
+    assert planner.pick(10) == "slow"
+    assert planner.pick(10) == "fast"
+    assert planner.pick(10) == "slow"
+    # Both at cap=2; relax so upload can finish.
+    assert planner.pick(10) in {"fast", "slow"}
+    assert planner.shard_count("fast") + planner.shard_count("slow") == 5
+
+
+def test_placement_balance_uses_placeable_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("services.capacity.STORAGE_FULL_RATIO", 0.8)
+    monkeypatch.setattr("services.capacity.SHARD_BALANCE_SLACK", 0.2)
+    planner = PlacementPlanner(
+        quotas=[
+            AccountQuota(account_id="full", used=80, total=100),
+            AccountQuota(account_id="a", used=0, total=10_000),
+            AccountQuota(account_id="b", used=0, total=10_000),
+        ]
+    )
+    # Placeable = 2 (full excluded) → ceil(10/2 * 1.2) = 6
+    assert planner.configure_balance(10) == 6
+    for _ in range(6):
+        assert planner.pick(10) in {"a", "b"}
+    assert planner.shard_count("full") == 0
+    assert planner.shard_count("a") <= 6
+    assert planner.shard_count("b") <= 6
+
+
+def test_placement_balance_seeds_resume(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("services.capacity.SHARD_BALANCE_SLACK", 0.0)
+    planner = PlacementPlanner(
+        quotas=[
+            AccountQuota(account_id="a", used=0, total=10_000),
+            AccountQuota(account_id="b", used=0, total=10_000),
+        ]
+    )
+    assert planner.configure_balance(4) == 2
+    planner.seed_shards({"a": 2})
+    # a is already at cap; next picks should prefer b.
+    assert planner.pick(10) == "b"
+    assert planner.pick(10) == "b"
+
+
+def test_placement_balance_skipped_when_total_unknown() -> None:
+    planner = PlacementPlanner(
+        quotas=[AccountQuota(account_id="a", used=0, total=1000)]
+    )
+    assert planner.configure_balance(None) is None
+    assert planner.balance_cap() is None

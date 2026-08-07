@@ -178,7 +178,7 @@ def test_cancel_upload(unlocked_client: TestClient) -> None:
     assert listing == []
     # Per-file folder delete should leave no orphan shards in the memory provider.
     assert MemoryProvider._store == {}
-    assert MemoryProvider._folders == {}
+    assert MemoryProvider._folders == {MemoryProvider.VAULT_ROOT_ID: set()}
 
 
 def test_accounts_list_and_storage(unlocked_client: TestClient) -> None:

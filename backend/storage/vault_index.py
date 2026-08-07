@@ -1,9 +1,24 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from storage import auth_context
 from storage.db import connect
+
+
+def _thumb_from_row(file_row: Any) -> dict[str, Any]:
+    keys = file_row.keys() if hasattr(file_row, "keys") else ()
+    status = file_row["thumb_status"] if "thumb_status" in keys else "none"
+    return {
+        "status": status or "none",
+        "account_id": file_row["thumb_account_id"] if "thumb_account_id" in keys else None,
+        "remote_id": file_row["thumb_remote_id"] if "thumb_remote_id" in keys else None,
+        "wrapped_key": file_row["thumb_wrapped_key"] if "thumb_wrapped_key" in keys else None,
+        "mime": file_row["thumb_mime"] if "thumb_mime" in keys else None,
+        "bytes": file_row["thumb_bytes"] if "thumb_bytes" in keys else None,
+        "error": file_row["thumb_error"] if "thumb_error" in keys else None,
+    }
 
 
 def _entry_from_rows(
@@ -11,6 +26,7 @@ def _entry_from_rows(
     shard_rows: list[Any],
     folder_rows: list[Any],
 ) -> dict[str, Any]:
+    thumb = _thumb_from_row(file_row)
     return {
         "id": file_row["id"],
         "path": file_row["path"],
@@ -34,13 +50,20 @@ def _entry_from_rows(
             }
             for row in shard_rows
         ],
+        "created_at": file_row["created_at"],
+        "updated_at": file_row["updated_at"],
+        "thumb_status": thumb["status"],
+        "thumb": thumb,
     }
 
 
 def _load_entry(conn: Any, file_id: str, user_id: str) -> dict[str, Any] | None:
     file_row = conn.execute(
         """
-        SELECT id, path, size, mtime, chunk_size, crypto_alg, wrapped_file_key
+        SELECT id, path, size, mtime, chunk_size, crypto_alg, wrapped_file_key,
+               created_at, updated_at,
+               thumb_status, thumb_account_id, thumb_remote_id, thumb_wrapped_key,
+               thumb_mime, thumb_bytes, thumb_error
         FROM files
         WHERE id = ? AND user_id = ?
         """,
@@ -74,7 +97,10 @@ def load_index(*, user_id: str | None = None) -> dict[str, Any]:
     with connect() as conn:
         file_rows = conn.execute(
             """
-            SELECT id, path, size, mtime, chunk_size, crypto_alg, wrapped_file_key
+            SELECT id, path, size, mtime, chunk_size, crypto_alg, wrapped_file_key,
+                   created_at, updated_at,
+                   thumb_status, thumb_account_id, thumb_remote_id, thumb_wrapped_key,
+                   thumb_mime, thumb_bytes, thumb_error
             FROM files
             WHERE user_id = ?
             ORDER BY path
@@ -114,6 +140,107 @@ def count_files(*, user_id: str | None = None) -> int:
     return int(row["n"]) if row else 0
 
 
+def usage_for_account(
+    account_id: str,
+    *,
+    user_id: str | None = None,
+) -> dict[str, Any]:
+    """How many indexed shards/thumbs still reference ``account_id``."""
+    uid = user_id or auth_context.require_user_id()
+    with connect() as conn:
+        shard_row = conn.execute(
+            """
+            SELECT COUNT(*) AS n, COUNT(DISTINCT s.file_id) AS files
+            FROM shards s
+            JOIN files f ON f.id = s.file_id
+            WHERE f.user_id = ? AND s.account_id = ?
+            """,
+            (uid, account_id),
+        ).fetchone()
+        thumb_row = conn.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM files
+            WHERE user_id = ? AND thumb_account_id = ? AND thumb_remote_id IS NOT NULL
+            """,
+            (uid, account_id),
+        ).fetchone()
+        paths = [
+            row["path"]
+            for row in conn.execute(
+                """
+                SELECT DISTINCT f.path
+                FROM shards s
+                JOIN files f ON f.id = s.file_id
+                WHERE f.user_id = ? AND s.account_id = ?
+                ORDER BY f.path
+                LIMIT 5
+                """,
+                (uid, account_id),
+            ).fetchall()
+        ]
+    shard_count = int(shard_row["n"]) if shard_row else 0
+    file_count = int(shard_row["files"]) if shard_row else 0
+    thumb_count = int(thumb_row["n"]) if thumb_row else 0
+    return {
+        "shard_count": shard_count,
+        "file_count": file_count,
+        "thumb_count": thumb_count,
+        "sample_paths": paths,
+        "in_use": shard_count > 0 or thumb_count > 0,
+    }
+
+
+def keep_refs_for_account(
+    account_id: str,
+    *,
+    user_id: str | None = None,
+) -> dict[str, set[str]]:
+    """Names (file ids) and remote ids that prune must keep for ``account_id``."""
+    uid = user_id or auth_context.require_user_id()
+    names: set[str] = set()
+    folder_ids: set[str] = set()
+    shard_remote_ids: set[str] = set()
+    with connect() as conn:
+        for row in conn.execute(
+            """
+            SELECT frf.file_id, frf.remote_folder_id
+            FROM file_remote_folders frf
+            JOIN files f ON f.id = frf.file_id
+            WHERE f.user_id = ? AND frf.account_id = ?
+            """,
+            (uid, account_id),
+        ).fetchall():
+            names.add(row["file_id"])
+            folder_ids.add(row["remote_folder_id"])
+        for row in conn.execute(
+            """
+            SELECT s.file_id, s.remote_id
+            FROM shards s
+            JOIN files f ON f.id = s.file_id
+            WHERE f.user_id = ? AND s.account_id = ?
+            """,
+            (uid, account_id),
+        ).fetchall():
+            names.add(row["file_id"])
+            shard_remote_ids.add(row["remote_id"])
+        for row in conn.execute(
+            """
+            SELECT id, thumb_remote_id
+            FROM files
+            WHERE user_id = ? AND thumb_account_id = ? AND thumb_remote_id IS NOT NULL
+            """,
+            (uid, account_id),
+        ).fetchall():
+            names.add(f"thumb_{row['id']}.webp.enc")
+            shard_remote_ids.add(row["thumb_remote_id"])
+    return {
+        "names": names,
+        "folder_ids": folder_ids,
+        "shard_remote_ids": shard_remote_ids,
+    }
+
+
 def upsert_file(
     index: dict[str, Any] | None,
     entry: dict[str, Any],
@@ -123,7 +250,30 @@ def upsert_file(
     """Persist a file entry (and optional in-memory index update)."""
     uid = user_id or auth_context.require_user_id()
     crypto = entry.get("crypto") or {}
+    now = int(time.time())
+    mtime = int(entry.get("mtime") or now)
     with connect() as conn:
+        existing = conn.execute(
+            "SELECT created_at FROM files WHERE id = ? AND user_id = ?",
+            (entry["id"], uid),
+        ).fetchone()
+        created_at = (
+            int(existing["created_at"])
+            if existing is not None
+            else int(entry.get("created_at") or now)
+        )
+        entry["mtime"] = mtime
+        entry["created_at"] = created_at
+        entry["updated_at"] = now
+        # Content replace clears thumb until regenerate (unless entry already has one).
+        thumb_status = entry.get("thumb_status") or "none"
+        entry["thumb_status"] = thumb_status
+        # Thumb metadata may arrive nested (a "thumb" dict) or as flat "thumb_*" keys.
+        thumb_dict = entry["thumb"] if isinstance(entry.get("thumb"), dict) else None
+
+        def _thumb_col(key: str, flat: str) -> Any:
+            return thumb_dict.get(key) if thumb_dict is not None else entry.get(flat)
+
         # Replace any other file at the same path for this user.
         conn.execute(
             "DELETE FROM files WHERE user_id = ? AND path = ? AND id != ?",
@@ -132,25 +282,45 @@ def upsert_file(
         conn.execute(
             """
             INSERT INTO files (
-              id, user_id, path, size, mtime, chunk_size, crypto_alg, wrapped_file_key
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+              id, user_id, path, size, mtime, chunk_size, crypto_alg, wrapped_file_key,
+              created_at, updated_at,
+              thumb_status, thumb_account_id, thumb_remote_id, thumb_wrapped_key,
+              thumb_mime, thumb_bytes, thumb_error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
               path = excluded.path,
               size = excluded.size,
               mtime = excluded.mtime,
               chunk_size = excluded.chunk_size,
               crypto_alg = excluded.crypto_alg,
-              wrapped_file_key = excluded.wrapped_file_key
+              wrapped_file_key = excluded.wrapped_file_key,
+              updated_at = excluded.updated_at,
+              thumb_status = excluded.thumb_status,
+              thumb_account_id = excluded.thumb_account_id,
+              thumb_remote_id = excluded.thumb_remote_id,
+              thumb_wrapped_key = excluded.thumb_wrapped_key,
+              thumb_mime = excluded.thumb_mime,
+              thumb_bytes = excluded.thumb_bytes,
+              thumb_error = excluded.thumb_error
             """,
             (
                 entry["id"],
                 uid,
                 entry["path"],
                 int(entry["size"]),
-                int(entry["mtime"]),
+                mtime,
                 int(entry["chunk_size"]),
                 crypto.get("alg") or "AES-256-GCM-CHUNK",
                 crypto["wrapped_file_key"],
+                created_at,
+                now,
+                thumb_status,
+                _thumb_col("account_id", "thumb_account_id"),
+                _thumb_col("remote_id", "thumb_remote_id"),
+                _thumb_col("wrapped_key", "thumb_wrapped_key"),
+                _thumb_col("mime", "thumb_mime"),
+                _thumb_col("bytes", "thumb_bytes"),
+                _thumb_col("error", "thumb_error"),
             ),
         )
         conn.execute("DELETE FROM shards WHERE file_id = ?", (entry["id"],))
@@ -214,3 +384,152 @@ def remove_file(
 def save_index(index: dict[str, Any]) -> None:
     """No-op write-through compatibility: mutations already persist via upsert/remove."""
     _ = index
+
+
+def find_file_by_path(path: str, *, user_id: str | None = None) -> dict[str, Any] | None:
+    uid = user_id or auth_context.require_user_id()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT id FROM files WHERE user_id = ? AND path = ?",
+            (uid, path),
+        ).fetchone()
+        if row is None:
+            return None
+        return _load_entry(conn, row["id"], uid)
+
+
+def list_files_under_prefix(
+    prefix: str,
+    *,
+    user_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Files at ``prefix`` itself or under ``prefix/``."""
+    uid = user_id or auth_context.require_user_id()
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id FROM files
+            WHERE user_id = ? AND (path = ? OR path LIKE ?)
+            ORDER BY path
+            """,
+            (uid, prefix, prefix + "/%"),
+        ).fetchall()
+        return [
+            entry
+            for row in rows
+            if (entry := _load_entry(conn, row["id"], uid)) is not None
+        ]
+
+
+def rename_file_path(
+    file_id: str,
+    new_path: str,
+    *,
+    user_id: str | None = None,
+) -> dict[str, Any] | None:
+    uid = user_id or auth_context.require_user_id()
+    with connect() as conn:
+        entry = _load_entry(conn, file_id, uid)
+        if entry is None:
+            return None
+        conflict = conn.execute(
+            "SELECT id FROM files WHERE user_id = ? AND path = ? AND id != ?",
+            (uid, new_path, file_id),
+        ).fetchone()
+        if conflict is not None:
+            raise ValueError(f"A file already exists at {new_path}")
+        now = int(time.time())
+        conn.execute(
+            """
+            UPDATE files
+            SET path = ?, mtime = ?, updated_at = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (new_path, now, now, file_id, uid),
+        )
+        entry["path"] = new_path
+        entry["mtime"] = now
+        entry["updated_at"] = now
+        return entry
+
+
+def update_thumbnail(
+    file_id: str,
+    *,
+    status: str,
+    account_id: str | None = None,
+    remote_id: str | None = None,
+    wrapped_key: str | None = None,
+    mime: str | None = None,
+    size_bytes: int | None = None,
+    error: str | None = None,
+    user_id: str | None = None,
+) -> None:
+    """Persist thumbnail metadata without touching shards."""
+    uid = user_id or auth_context.require_user_id()
+    with connect() as conn:
+        conn.execute(
+            """
+            UPDATE files
+            SET thumb_status = ?,
+                thumb_account_id = ?,
+                thumb_remote_id = ?,
+                thumb_wrapped_key = ?,
+                thumb_mime = ?,
+                thumb_bytes = ?,
+                thumb_error = ?,
+                updated_at = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (
+                status,
+                account_id,
+                remote_id,
+                wrapped_key,
+                mime,
+                size_bytes,
+                error,
+                int(time.time()),
+                file_id,
+                uid,
+            ),
+        )
+
+
+def rename_files_under_prefix(
+    old_prefix: str,
+    new_prefix: str,
+    *,
+    user_id: str | None = None,
+) -> int:
+    uid = user_id or auth_context.require_user_id()
+    now = int(time.time())
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, path FROM files
+            WHERE user_id = ? AND (path = ? OR path LIKE ?)
+            ORDER BY length(path) DESC
+            """,
+            (uid, old_prefix, old_prefix + "/%"),
+        ).fetchall()
+        updated = 0
+        for row in rows:
+            suffix = row["path"][len(old_prefix) :]
+            dest = new_prefix + suffix
+            conflict = conn.execute(
+                "SELECT id FROM files WHERE user_id = ? AND path = ? AND id != ?",
+                (uid, dest, row["id"]),
+            ).fetchone()
+            if conflict is not None:
+                raise ValueError(f"A file already exists at {dest}")
+            conn.execute(
+                """
+                UPDATE files
+                SET path = ?, mtime = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (dest, now, now, row["id"]),
+            )
+            updated += 1
+        return updated

@@ -1,25 +1,38 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
 from config import DATA_DIR, DB_PATH
 
+log = logging.getLogger(__name__)
+
 _lock = threading.Lock()
 _initialized = False
 
+# Bump when adding a migration. Fresh installs still run migrations (idempotent).
+SCHEMA_VERSION = 4
+
 SCHEMA = """
 PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version INTEGER PRIMARY KEY,
+  applied_at INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS users (
   id TEXT PRIMARY KEY,
   username TEXT NOT NULL UNIQUE,
   kdf_salt TEXT NOT NULL,
   verifier TEXT NOT NULL,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS accounts (
@@ -28,7 +41,20 @@ CREATE TABLE IF NOT EXISTS accounts (
   provider TEXT NOT NULL,
   label TEXT NOT NULL,
   credentials_enc TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
   UNIQUE (user_id, provider, label)
+);
+
+CREATE TABLE IF NOT EXISTS folders (
+  id TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  path TEXT NOT NULL,
+  mtime INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  UNIQUE (user_id, path)
 );
 
 CREATE TABLE IF NOT EXISTS files (
@@ -40,6 +66,15 @@ CREATE TABLE IF NOT EXISTS files (
   chunk_size INTEGER NOT NULL,
   crypto_alg TEXT NOT NULL,
   wrapped_file_key TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  thumb_status TEXT NOT NULL DEFAULT 'none',
+  thumb_account_id TEXT,
+  thumb_remote_id TEXT,
+  thumb_wrapped_key TEXT,
+  thumb_mime TEXT,
+  thumb_bytes INTEGER,
+  thumb_error TEXT,
   UNIQUE (user_id, path)
 );
 
@@ -71,6 +106,7 @@ CREATE TABLE IF NOT EXISTS upload_sessions (
   crypto_alg TEXT NOT NULL,
   wrapped_file_key TEXT NOT NULL,
   error TEXT,
+  created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
 
@@ -117,6 +153,155 @@ def connect() -> Iterator[sqlite3.Connection]:
             conn.close()
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return {str(r[1]) for r in rows}
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def _add_column_if_missing(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    decl: str,
+) -> bool:
+    """ADD COLUMN when missing. Returns True if a column was added."""
+    if not _table_exists(conn, table):
+        return False
+    if column in _table_columns(conn, table):
+        return False
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    return True
+
+
+def _current_version(conn: sqlite3.Connection) -> int:
+    if not _table_exists(conn, "schema_migrations"):
+        return 0
+    row = conn.execute("SELECT COALESCE(MAX(version), 0) AS v FROM schema_migrations").fetchone()
+    return int(row["v"]) if row else 0
+
+
+def _record_migration(conn: sqlite3.Connection, version: int) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+        (version, int(time.time())),
+    )
+
+
+def _migrate_v2_timestamps(conn: sqlite3.Connection) -> None:
+    """Add created_at / updated_at to entity tables; backfill from existing clocks."""
+    now = int(time.time())
+
+    # users: created_at already existed; add updated_at
+    if _add_column_if_missing(conn, "users", "updated_at", "INTEGER"):
+        conn.execute(
+            "UPDATE users SET updated_at = COALESCE(created_at, ?) WHERE updated_at IS NULL",
+            (now,),
+        )
+
+    # accounts
+    added_acc_c = _add_column_if_missing(conn, "accounts", "created_at", "INTEGER")
+    added_acc_u = _add_column_if_missing(conn, "accounts", "updated_at", "INTEGER")
+    if added_acc_c or added_acc_u:
+        conn.execute(
+            """
+            UPDATE accounts
+            SET created_at = COALESCE(created_at, ?),
+                updated_at = COALESCE(updated_at, created_at, ?)
+            """,
+            (now, now),
+        )
+
+    # folders: backfill from mtime
+    added_fol_c = _add_column_if_missing(conn, "folders", "created_at", "INTEGER")
+    added_fol_u = _add_column_if_missing(conn, "folders", "updated_at", "INTEGER")
+    if added_fol_c or added_fol_u:
+        conn.execute(
+            """
+            UPDATE folders
+            SET created_at = COALESCE(created_at, mtime, ?),
+                updated_at = COALESCE(updated_at, mtime, created_at, ?)
+            """,
+            (now, now),
+        )
+
+    # files: backfill from mtime
+    added_file_c = _add_column_if_missing(conn, "files", "created_at", "INTEGER")
+    added_file_u = _add_column_if_missing(conn, "files", "updated_at", "INTEGER")
+    if added_file_c or added_file_u:
+        conn.execute(
+            """
+            UPDATE files
+            SET created_at = COALESCE(created_at, mtime, ?),
+                updated_at = COALESCE(updated_at, mtime, created_at, ?)
+            """,
+            (now, now),
+        )
+
+    # upload_sessions: created_at from updated_at
+    if _add_column_if_missing(conn, "upload_sessions", "created_at", "INTEGER"):
+        conn.execute(
+            """
+            UPDATE upload_sessions
+            SET created_at = COALESCE(created_at, updated_at, ?)
+            """,
+            (now,),
+        )
+
+
+def _migrate_v3_thumbnails(conn: sqlite3.Connection) -> None:
+    """Add encrypted remote thumbnail metadata columns on files."""
+    _add_column_if_missing(conn, "files", "thumb_status", "TEXT NOT NULL DEFAULT 'none'")
+    _add_column_if_missing(conn, "files", "thumb_account_id", "TEXT")
+    _add_column_if_missing(conn, "files", "thumb_remote_id", "TEXT")
+    _add_column_if_missing(conn, "files", "thumb_wrapped_key", "TEXT")
+    _add_column_if_missing(conn, "files", "thumb_mime", "TEXT")
+    _add_column_if_missing(conn, "files", "thumb_bytes", "INTEGER")
+    _add_column_if_missing(conn, "files", "thumb_error", "TEXT")
+    conn.execute(
+        "UPDATE files SET thumb_status = 'none' WHERE thumb_status IS NULL OR thumb_status = ''"
+    )
+
+
+def _migrate_v4_account_enabled(conn: sqlite3.Connection) -> None:
+    """Per-account upload placement toggle (1 = used for new shards)."""
+    _add_column_if_missing(conn, "accounts", "enabled", "INTEGER NOT NULL DEFAULT 1")
+    conn.execute("UPDATE accounts SET enabled = 1 WHERE enabled IS NULL")
+
+
+MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
+    2: _migrate_v2_timestamps,
+    3: _migrate_v3_thumbnails,
+    4: _migrate_v4_account_enabled,
+}
+
+
+def _run_migrations(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          version INTEGER PRIMARY KEY,
+          applied_at INTEGER NOT NULL
+        );
+        """
+    )
+    current = _current_version(conn)
+    for version in sorted(MIGRATIONS):
+        if version <= current:
+            continue
+        log.info("Applying DB migration v%s", version)
+        MIGRATIONS[version](conn)
+        _record_migration(conn, version)
+        current = version
+
+
 def init_db(path: Path | None = None) -> None:
     global _initialized
     db_path = path or DB_PATH
@@ -124,8 +309,14 @@ def init_db(path: Path | None = None) -> None:
     with _lock:
         conn = _connect(db_path)
         try:
+            # CREATE IF NOT EXISTS for brand-new tables (full current schema).
             conn.executescript(SCHEMA)
+            # ALTER / backfill for existing DBs.
+            _run_migrations(conn)
             conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
         _initialized = True

@@ -56,7 +56,7 @@ def live_client(live_data_dir) -> Iterator[TestClient]:
 
     jobs._jobs.clear()
     jobs._subs.clear()
-    upload_pipelines._pipelines.clear()
+    upload_pipelines.reset_live_slots()
     download_sessions._sessions.clear()
 
     with TestClient(app) as client:

@@ -191,6 +191,44 @@ class GDriveProvider:
 
         return self._run_timed(_do, op=f"ensure_file_folder name={file_id}")
 
+    def list_vault_children(self) -> list[dict[str, str]]:
+        """List immediate children of the vault root folder."""
+
+        def _do() -> list[dict[str, str]]:
+            root_id = self._ensure_folder()
+            service = self._service()
+            out: list[dict[str, str]] = []
+            page_token: str | None = None
+            folder_mime = "application/vnd.google-apps.folder"
+            query = f"'{root_id}' in parents and trashed = false"
+            while True:
+                response = (
+                    service.files()
+                    .list(
+                        q=query,
+                        spaces="drive",
+                        fields="nextPageToken, files(id, name, mimeType)",
+                        pageSize=100,
+                        pageToken=page_token,
+                    )
+                    .execute()
+                )
+                for item in response.get("files", []):
+                    kind = "folder" if item.get("mimeType") == folder_mime else "file"
+                    out.append(
+                        {
+                            "id": item["id"],
+                            "name": item.get("name") or "",
+                            "kind": kind,
+                        }
+                    )
+                page_token = response.get("nextPageToken")
+                if not page_token:
+                    break
+            return out
+
+        return self._run_timed(_do, op="list_vault_children")
+
     def _run_timed(self, fn, *, op: str):  # noqa: ANN001
         """Run a Drive call with a hard timeout; do not block forever on shutdown."""
         t0 = time.monotonic()
@@ -270,6 +308,22 @@ class GDriveProvider:
             return buffer.getvalue()
 
         return self._run_timed(_do, op=f"download id={remote_id}")
+
+    def exists(self, remote_id: str) -> bool:
+        def _do() -> bool:
+            try:
+                self._service().files().get(fileId=remote_id, fields="id").execute()
+                return True
+            except Exception as exc:
+                status = getattr(getattr(exc, "resp", None), "status", None)
+                if status == 404:
+                    return False
+                err = str(exc).lower()
+                if "404" in err or "not found" in err or "file not found" in err:
+                    return False
+                raise
+
+        return self._run_timed(_do, op=f"exists id={remote_id}")
 
     def delete(self, remote_id: str) -> None:
         def _do() -> None:

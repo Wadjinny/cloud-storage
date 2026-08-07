@@ -53,6 +53,7 @@ def _session_from_rows(
             for r in shard_rows
         ],
         "error": row["error"],
+        "created_at": row["created_at"],
         "updated_at": row["updated_at"],
     }
 
@@ -60,16 +61,26 @@ def _session_from_rows(
 def save(session: dict[str, Any]) -> None:
     uid = session.get("user_id") or auth_context.require_user_id()
     crypto = session.get("crypto") or {}
-    updated_at = int(time.time())
+    now = int(time.time())
     session["user_id"] = uid
-    session["updated_at"] = updated_at
+    session["updated_at"] = now
     with connect() as conn:
+        existing = conn.execute(
+            "SELECT created_at FROM upload_sessions WHERE id = ?",
+            (session["id"],),
+        ).fetchone()
+        created_at = (
+            int(existing["created_at"])
+            if existing is not None
+            else int(session.get("created_at") or now)
+        )
+        session["created_at"] = created_at
         conn.execute(
             """
             INSERT INTO upload_sessions (
               id, user_id, status, path, filename, size, chunk_size,
-              crypto_alg, wrapped_file_key, error, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              crypto_alg, wrapped_file_key, error, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
               user_id = excluded.user_id,
               status = excluded.status,
@@ -93,7 +104,8 @@ def save(session: dict[str, Any]) -> None:
                 crypto.get("alg") or "AES-256-GCM-CHUNK",
                 crypto["wrapped_file_key"],
                 session.get("error"),
-                updated_at,
+                created_at,
+                now,
             ),
         )
         conn.execute(
@@ -180,6 +192,37 @@ def delete(session_id: str, *, user_id: str | None = None) -> None:
             )
         else:
             conn.execute("DELETE FROM upload_sessions WHERE id = ?", (session_id,))
+
+
+def list_for_account(
+    account_id: str,
+    *,
+    status: str | None = None,
+    user_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Sessions that have a remote folder on ``account_id`` (optionally filtered by status)."""
+    uid = user_id or auth_context.require_user_id()
+    sql = """
+        SELECT us.id, us.status, us.filename, usrf.remote_folder_id
+        FROM upload_sessions us
+        JOIN upload_session_remote_folders usrf ON usrf.session_id = us.id
+        WHERE us.user_id = ? AND usrf.account_id = ?
+    """
+    params: list[Any] = [uid, account_id]
+    if status is not None:
+        sql += " AND us.status = ?"
+        params.append(status)
+    with connect() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "status": row["status"],
+            "filename": row["filename"],
+            "remote_folder_id": row["remote_folder_id"],
+        }
+        for row in rows
+    ]
 
 
 def mark_failed(session_id: str, error: str) -> dict[str, Any] | None:

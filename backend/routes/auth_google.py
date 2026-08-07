@@ -15,7 +15,7 @@ from config import (
     GOOGLE_SCOPES,
     google_configured,
 )
-from deps import require_unlocked
+from deps import require_accounts_manageable
 from storage import accounts as accounts_store
 
 router = APIRouter(prefix="/api/auth/google", tags=["auth"])
@@ -39,7 +39,7 @@ def _flow() -> Flow:
 
 @router.get("/start")
 def google_start(request: Request) -> RedirectResponse:
-    require_unlocked(request)
+    require_accounts_manageable(request)
     if not google_configured():
         raise HTTPException(
             status_code=503,
@@ -61,7 +61,8 @@ def google_start(request: Request) -> RedirectResponse:
 @router.get("/callback")
 def google_callback(request: Request, code: str | None = None, state: str | None = None) -> RedirectResponse:
     # Session must still be unlocked so we can encrypt stored credentials.
-    require_unlocked(request)
+    # Also refuse to finish connecting while the user has a running transfer.
+    require_accounts_manageable(request)
     if not google_configured():
         raise HTTPException(status_code=503, detail="Google OAuth is not configured")
     if not code or not state or state != request.session.get("oauth_state"):

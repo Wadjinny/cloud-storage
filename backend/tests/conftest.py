@@ -108,10 +108,13 @@ def client(data_dir: Path, small_chunks: None, memory_account: dict) -> Iterator
     from services.jobs import jobs
     from services.upload_pipeline import upload_pipelines
 
+    from services.capacity import reset_placement_stripes
+
     jobs._jobs.clear()
     jobs._subs.clear()
-    upload_pipelines._pipelines.clear()
+    upload_pipelines.reset_live_slots()
     download_sessions._sessions.clear()
+    reset_placement_stripes()
 
     with TestClient(app) as test_client:
         yield test_client
@@ -137,7 +140,7 @@ def stream_client(
 
     jobs._jobs.clear()
     jobs._subs.clear()
-    upload_pipelines._pipelines.clear()
+    upload_pipelines.reset_live_slots()
     download_sessions._sessions.clear()
 
     with TestClient(app) as test_client:
@@ -205,7 +208,7 @@ def unlocked_disk_stream_client(
 
     jobs._jobs.clear()
     jobs._subs.clear()
-    upload_pipelines._pipelines.clear()
+    upload_pipelines.reset_live_slots()
     download_sessions._sessions.clear()
 
     with TestClient(app) as test_client:

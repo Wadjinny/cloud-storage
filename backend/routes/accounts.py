@@ -4,19 +4,29 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel
 
 from config import STORAGE_FULL_RATIO
-from deps import require_unlocked
+from deps import require_accounts_manageable, require_unlocked
 from providers.factory import get_provider
+from services import health as health_service
+from services import prune as prune_service
 from services.capacity import headroom_bytes, is_full
+from services.jobs import jobs
 from storage import accounts as accounts_store
 from storage import auth_context
+from storage import upload_sessions
+from storage import vault_index
 
 router = APIRouter(prefix="/api/accounts", tags=["accounts"])
 
 
+class AccountEnabledBody(BaseModel):
+    enabled: bool
+
+
 @router.get("")
-def list_accounts(request: Request) -> list[dict[str, str]]:
+def list_accounts(request: Request) -> list[dict[str, Any]]:
     require_unlocked(request)
     return accounts_store.list_public()
 
@@ -26,6 +36,7 @@ def _quota_for_account(account: dict[str, Any]) -> dict[str, Any]:
         "id": account["id"],
         "provider": account["provider"],
         "label": account["label"],
+        "enabled": bool(account.get("enabled", True)),
         "used": None,
         "total": None,
         "available": None,
@@ -103,12 +114,90 @@ def list_storage(request: Request) -> dict[str, Any]:
     }
 
 
+@router.post("/health")
+def health_check(request: Request) -> dict[str, str]:
+    """Verify every indexed shard (and ready thumbnail) still exists on providers."""
+    master_key = require_unlocked(request)
+    user_id = auth_context.require_user_id()
+    job_id = jobs.run_in_thread(
+        "health",
+        user_id=user_id,
+        master_key=master_key,
+        work=health_service.check_shards,
+        queued_message="Starting health check…",
+    )
+    return {"job_id": job_id}
+
+
+@router.post("/prune/analyze")
+def prune_analyze(request: Request) -> dict[str, str]:
+    """Scan all accounts for orphan remotes; does not delete."""
+    master_key = require_unlocked(request)
+    user_id = auth_context.require_user_id()
+    job_id = jobs.run_in_thread(
+        "prune_analyze",
+        user_id=user_id,
+        master_key=master_key,
+        work=prune_service.analyze_all,
+        queued_message="Starting prune analysis…",
+    )
+    return {"job_id": job_id}
+
+
+@router.post("/prune")
+def prune_all(request: Request) -> dict[str, str]:
+    """Delete orphan remotes on every connected account."""
+    master_key = require_unlocked(request)
+    user_id = auth_context.require_user_id()
+    job_id = jobs.run_in_thread(
+        "prune",
+        user_id=user_id,
+        master_key=master_key,
+        work=prune_service.prune_all,
+        queued_message="Starting prune…",
+    )
+    return {"job_id": job_id}
+
+
+@router.patch("/{account_id}")
+def patch_account(request: Request, account_id: str, body: AccountEnabledBody) -> dict[str, Any]:
+    """Enable or disable an account for new upload placement (download/health unchanged)."""
+    require_accounts_manageable(request)
+    updated = accounts_store.set_enabled(account_id, body.enabled)
+    if updated is None:
+        raise HTTPException(status_code=404, detail="Account not found")
+    return updated
+
+
 @router.delete("/{account_id}")
 def delete_account(request: Request, account_id: str) -> dict[str, bool]:
-    require_unlocked(request)
+    require_accounts_manageable(request)
     account = accounts_store.get_account(account_id)
     if account is None:
         raise HTTPException(status_code=404, detail="Account not found")
+
+    usage = vault_index.usage_for_account(account_id)
+    if usage["in_use"]:
+        parts: list[str] = []
+        if usage["shard_count"]:
+            parts.append(
+                f"{usage['shard_count']} shard(s) in {usage['file_count']} file(s)"
+            )
+        if usage["thumb_count"]:
+            parts.append(f"{usage['thumb_count']} thumbnail(s)")
+        sample = usage.get("sample_paths") or []
+        detail = "Account still holds " + " and ".join(parts) + ". Delete those files first."
+        if sample:
+            detail += " Examples: " + ", ".join(sample)
+        raise HTTPException(status_code=409, detail=detail)
+
+    active = upload_sessions.list_for_account(account_id, status="active")
+    if active:
+        raise HTTPException(
+            status_code=409,
+            detail="Account has an active upload. Cancel it before disconnecting.",
+        )
+
     if account["provider"] == "mega":
         from providers.mega_session import mega_sessions
 

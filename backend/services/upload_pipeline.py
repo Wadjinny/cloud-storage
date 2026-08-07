@@ -41,22 +41,35 @@ class UploadPipeline:
     session_id: str
     resume_from_byte: int = 0
     chunk_queue: queue.Queue[Any] = field(init=False)
-    # One permit per live plaintext shard (acquired in put_chunk, released after upload).
-    shard_slots: threading.BoundedSemaphore = field(init=False)
     done: threading.Event = field(default_factory=threading.Event)
     cancel_requested: threading.Event = field(default_factory=threading.Event)
     error: str | None = None
 
     def __post_init__(self) -> None:
-        slots = _live_shard_slots()
-        self.chunk_queue = queue.Queue(maxsize=slots)
-        self.shard_slots = threading.BoundedSemaphore(slots)
+        # Queue depth matches the global live-slot cap so one busy file cannot
+        # buffer more plaintext than the shared semaphore allows.
+        self.chunk_queue = queue.Queue(maxsize=_live_shard_slots())
 
 
 class UploadPipelineHub:
+    """All pipelines share one live-plaintext slot pool (SHARD_UPLOAD_CONCURRENCY).
+
+    That lets several small files upload in parallel without multiplying RAM, as
+    long as the client starts multiple jobs.
+    """
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._pipelines: dict[str, UploadPipeline] = {}
+        self._live_slots_n = _live_shard_slots()
+        self._live_slots = threading.BoundedSemaphore(self._live_slots_n)
+
+    def reset_live_slots(self) -> None:
+        """Rebuild the shared slot pool (tests after monkeypatching concurrency)."""
+        with self._lock:
+            self._pipelines.clear()
+            self._live_slots_n = _live_shard_slots()
+            self._live_slots = threading.BoundedSemaphore(self._live_slots_n)
 
     def start(
         self,
@@ -102,7 +115,7 @@ class UploadPipelineHub:
             size,
             shard_size,
             pipeline.resume_from_byte,
-            _live_shard_slots(),
+            self._live_slots_n,
         )
         return pipeline
 
@@ -110,13 +123,32 @@ class UploadPipelineHub:
         with self._lock:
             return self._pipelines.get(job_id)
 
+    def has_for_user(self, user_id: str) -> bool:
+        with self._lock:
+            return any(p.user_id == user_id for p in self._pipelines.values())
+
+    def live_session_ids(self, *, user_id: str | None = None) -> set[str]:
+        """Session ids currently bound to an in-memory upload pipeline."""
+        with self._lock:
+            return {
+                p.session_id
+                for p in self._pipelines.values()
+                if user_id is None or p.user_id == user_id
+            }
+
     def _drop(self, job_id: str) -> None:
         with self._lock:
             self._pipelines.pop(job_id, None)
 
-    def _release_slot(self, pipeline: UploadPipeline) -> None:
+    def _acquire_slot(self, pipeline: UploadPipeline, *, timeout: float) -> bool:
+        if pipeline.cancel_requested.is_set() or pipeline.done.is_set():
+            return False
+        return self._live_slots.acquire(timeout=timeout)
+
+    def _release_slot(self, pipeline: UploadPipeline | None = None) -> None:
+        del pipeline  # unused; kept so call sites stay readable
         try:
-            pipeline.shard_slots.release()
+            self._live_slots.release()
         except ValueError:
             # Extra release; ignore so cancel/drain stays idempotent.
             pass
@@ -257,13 +289,13 @@ class UploadPipelineHub:
         pipeline = self.get(job_id)
         if pipeline is None:
             raise RuntimeError("Upload pipeline not found")
-        # Acquire a live-shard slot before retaining plaintext (bounds RAM by concurrency).
+        # Shared live-shard slot before retaining plaintext (bounds RAM across jobs).
         wait_t0 = time.monotonic()
         last_wait_log = wait_t0
         while True:
             if pipeline.cancel_requested.is_set() or pipeline.done.is_set():
                 raise UploadCancelled(pipeline.error or "Upload cancelled")
-            if pipeline.shard_slots.acquire(timeout=0.2):
+            if self._acquire_slot(pipeline, timeout=0.2):
                 break
             now = time.monotonic()
             if now - last_wait_log >= 5.0:
@@ -288,7 +320,7 @@ class UploadPipelineHub:
                 except queue.Full:
                     # Do not hold a live-shard slot while the queue is full — that
                     # stranded permits and made put_wait spike even with free workers.
-                    self._release_slot(pipeline)
+                    self._release_slot()
                     now = time.monotonic()
                     if now - last_wait_log >= 5.0:
                         log.info(
@@ -305,13 +337,13 @@ class UploadPipelineHub:
                     while True:
                         if pipeline.cancel_requested.is_set() or pipeline.done.is_set():
                             raise UploadCancelled(pipeline.error or "Upload cancelled")
-                        if pipeline.shard_slots.acquire(timeout=0.2):
+                        if self._acquire_slot(pipeline, timeout=0.2):
                             break
                         pipeline = self.get(job_id)
                         if pipeline is None:
                             raise UploadCancelled("Upload cancelled") from None
         except Exception:
-            self._release_slot(pipeline)
+            self._release_slot()
             raise
 
     def _offer_sentinel(self, pipeline: UploadPipeline, *, timeout: float = 30.0) -> None:

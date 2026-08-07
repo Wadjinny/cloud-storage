@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, EmailStr, Field
 
-from deps import require_unlocked
+from deps import require_accounts_manageable
 from providers.mega import verify_mega_login
 from storage import accounts as accounts_store
 
@@ -18,7 +18,7 @@ class MegaLoginBody(BaseModel):
 
 @router.post("")
 async def mega_login(request: Request, body: MegaLoginBody) -> dict[str, str]:
-    require_unlocked(request)
+    require_accounts_manageable(request)
     try:
         await verify_mega_login(body.email, body.password, body.mfa)
     except ValueError as exc:

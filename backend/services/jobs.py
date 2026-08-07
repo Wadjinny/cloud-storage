@@ -4,14 +4,18 @@ import queue
 import secrets
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
+
+ProgressCb = Callable[[str, int, int, str], None]
 
 
 @dataclass
 class Job:
     id: str
     kind: str
+    user_id: str | None = None
     status: str = "running"  # running | done | error
     phase: str = ""
     message: str = ""
@@ -54,17 +58,59 @@ class JobStore:
         self._jobs: dict[str, Job] = {}
         self._subs: dict[str, list[queue.Queue[dict[str, Any] | None]]] = {}
 
-    def create(self, kind: str) -> Job:
-        job = Job(id=f"job_{secrets.token_hex(8)}", kind=kind)
+    def create(self, kind: str, *, user_id: str | None = None) -> Job:
+        job = Job(id=f"job_{secrets.token_hex(8)}", kind=kind, user_id=user_id)
         with self._lock:
             self._jobs[job.id] = job
             self._prune_locked()
         self._notify(job.id)
         return job
 
+    def run_in_thread(
+        self,
+        kind: str,
+        *,
+        user_id: str,
+        master_key: bytes,
+        work: Callable[[ProgressCb], dict[str, Any] | None],
+        queued_message: str,
+    ) -> str:
+        """Create a job and run ``work(on_progress)`` in a daemon thread.
+
+        The worker runs inside the user's auth scope; its return value (if any)
+        is stored as the job's ``result_meta``, and any exception fails the job.
+        Returns the new job id.
+        """
+        # Imported here to avoid a storage->services import at module load.
+        from storage import auth_context
+
+        job = self.create(kind, user_id=user_id)
+        self.update(job.id, phase="queued", message=queued_message, current=0, total=1)
+
+        def _runner() -> None:
+            def on_progress(phase: str, current: int, total: int, message: str) -> None:
+                self.update(
+                    job.id, phase=phase, current=current, total=total, message=message
+                )
+
+            with auth_context.auth_scope(user_id, master_key):
+                try:
+                    self.complete(job.id, result_meta=work(on_progress))
+                except Exception as exc:
+                    self.fail(job.id, str(exc))
+
+        threading.Thread(target=_runner, daemon=True).start()
+        return job.id
+
     def get(self, job_id: str) -> Job | None:
         with self._lock:
             return self._jobs.get(job_id)
+
+    def has_running_for_user(self, user_id: str) -> bool:
+        with self._lock:
+            return any(
+                j.user_id == user_id and j.status == "running" for j in self._jobs.values()
+            )
 
     def update(
         self,

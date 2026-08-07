@@ -10,10 +10,11 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
 
 from config import (
+    DATA_DIR,
     DOWNLOAD_QUEUE_DEPTH,
     GDRIVE_ACCOUNT_DOWNLOAD_CONCURRENCY,
     GDRIVE_ACCOUNT_UPLOAD_CONCURRENCY,
@@ -22,13 +23,18 @@ from config import (
     SHARD_DOWNLOAD_CONCURRENCY,
     SHARD_UPLOAD_CONCURRENCY,
     STORAGE_FULL_RATIO,
+    THUMB_MAX_SOURCE_BYTES,
+    THUMB_VIDEO_SPOOL_BYTES,
     choose_chunk_size,
 )
 from providers.factory import get_provider
 from services import crypto
 from services.capacity import PlacementPlanner, cipher_size
+from services.thumbnails import attach_after_upload
+from services.thumbnails.classify import classify_filename
 from storage import accounts as accounts_store
 from storage import auth_context
+from storage import folders as folders_store
 from storage import upload_sessions
 from storage import vault_index
 
@@ -91,6 +97,183 @@ def list_entries(path: str = "/") -> list[dict[str, Any]]:
     return _list_entries_clean(index, _normalize_dir(path))
 
 
+def mkdir(parent: str, name: str) -> dict[str, Any]:
+    parent_norm = _normalize_dir(parent)
+    clean = folders_store.validate_name(name)
+    if any(
+        e["kind"] == "dir" and e["name"] == clean for e in list_entries(parent_norm)
+    ):
+        raise ValueError("Folder already exists")
+    if any(
+        e["kind"] == "file" and e["name"] == clean for e in list_entries(parent_norm)
+    ):
+        raise ValueError("A file already exists at that path")
+    folder = folders_store.mkdir(parent_norm, clean)
+    return {
+        "id": folder["id"],
+        "name": PurePosixPath(folder["path"]).name,
+        "path": folder["path"],
+        "size": None,
+        "mtime": folder.get("mtime"),
+        "kind": "dir",
+        "shard_count": 0,
+    }
+
+
+def _dir_exists(folder_path: str) -> bool:
+    """True if folder is registered or implied by nested files/folders."""
+    norm = folders_store.normalize_dir(folder_path)
+    if norm == "/":
+        return True
+    if folders_store.get_folder(norm) is not None:
+        return True
+    if vault_index.list_files_under_prefix(norm):
+        return True
+    # Child folders under this path.
+    for child in folders_store.list_child_names(norm):
+        if child["path"].startswith(norm + "/") or child["path"] == norm:
+            return True
+    # Nested folder rows deeper than one level.
+    parent = folders_store.normalize_dir(str(PurePosixPath(norm).parent))
+    name = PurePosixPath(norm).name
+    return any(c["name"] == name for c in folders_store.list_child_names(parent))
+
+
+def _dest_occupied(path: str, *, moving_prefix: str | None = None) -> str | None:
+    """Return 'file' / 'folder' if path is taken, else None.
+
+    Paths under ``moving_prefix`` are ignored (they move with the source).
+    """
+    if vault_index.find_file_by_path(path) is not None:
+        if moving_prefix and (
+            path == moving_prefix or path.startswith(moving_prefix + "/")
+        ):
+            pass
+        else:
+            return "file"
+    if _dir_exists(path):
+        if moving_prefix and (
+            path == moving_prefix or path.startswith(moving_prefix + "/")
+        ):
+            return None
+        return "folder"
+    return None
+
+
+def move_entry(*, src_path: str, dest_path: str, kind: str | None = None) -> dict[str, Any]:
+    """Move/rename a file or folder (DB path rewrite; remote shards unchanged)."""
+    src_raw = src_path.rstrip("/") if src_path != "/" else src_path
+    file_entry = vault_index.find_file_by_path(src_raw)
+    folder_path = folders_store.normalize_dir(src_path)
+
+    resolved_kind = kind
+    if resolved_kind not in ("file", "dir"):
+        if file_entry is not None:
+            resolved_kind = "file"
+        elif _dir_exists(folder_path):
+            resolved_kind = "dir"
+        else:
+            raise FileNotFoundError("Path not found")
+
+    if resolved_kind == "file":
+        if file_entry is None:
+            raise FileNotFoundError("File not found")
+        return _move_file(file_entry, dest_path)
+    return _move_folder(folder_path, dest_path)
+
+
+def _move_file(entry: dict[str, Any], dest_path: str) -> dict[str, Any]:
+    dest = dest_path.rstrip("/") if dest_path != "/" else dest_path
+    if not dest.startswith("/"):
+        dest = "/" + dest
+    folders_store.validate_name(PurePosixPath(dest).name)
+    parent = folders_store.normalize_dir(str(PurePosixPath(dest).parent))
+    if parent != "/":
+        folders_store.ensure_folder(parent)
+    occupied = _dest_occupied(dest)
+    if occupied:
+        raise ValueError(f"A {occupied} already exists at the destination")
+    updated = vault_index.rename_file_path(entry["id"], dest)
+    assert updated is not None
+    return {
+        "id": updated["id"],
+        "name": PurePosixPath(dest).name,
+        "path": dest,
+        "kind": "file",
+        "size": updated.get("size"),
+        "mtime": updated.get("mtime"),
+        "shard_count": len(updated.get("shards") or []),
+    }
+
+
+def _move_folder(src_path: str, dest_path: str) -> dict[str, Any]:
+    src = folders_store.normalize_dir(src_path)
+    dest = folders_store.normalize_dir(dest_path)
+    if src == "/":
+        raise ValueError("Cannot move root")
+    if dest == "/":
+        raise ValueError("Invalid destination")
+    if not _dir_exists(src):
+        raise FileNotFoundError("Folder not found")
+    if dest == src:
+        return {
+            "id": f"dir:{dest}",
+            "name": PurePosixPath(dest).name,
+            "path": dest,
+            "kind": "dir",
+            "size": None,
+            "mtime": None,
+            "shard_count": 0,
+        }
+    if dest.startswith(src + "/"):
+        raise ValueError("Cannot move a folder into itself")
+    folders_store.validate_name(PurePosixPath(dest).name)
+    occupied = _dest_occupied(dest, moving_prefix=src)
+    if occupied:
+        raise ValueError(f"A {occupied} already exists at the destination")
+
+    parent = folders_store.normalize_dir(str(PurePosixPath(dest).parent))
+    if parent != "/":
+        folders_store.ensure_folder(parent)
+
+    vault_index.rename_files_under_prefix(src, dest)
+    folders_store.rename_folder_tree(src, dest)
+    folders_store.ensure_folder(dest)
+    return {
+        "id": f"dir:{dest}",
+        "name": PurePosixPath(dest).name,
+        "path": dest,
+        "kind": "dir",
+        "size": None,
+        "mtime": None,
+        "shard_count": 0,
+    }
+
+
+def delete_directory(path: str, on_progress: ProgressFn | None = None) -> dict[str, Any]:
+    """Recursively delete a folder: all files under it, then folder rows."""
+    folder_path = folders_store.normalize_dir(path)
+    if folder_path == "/":
+        raise ValueError("Cannot delete root")
+    if not _dir_exists(folder_path):
+        raise FileNotFoundError("Folder not found")
+
+    files = vault_index.list_files_under_prefix(folder_path)
+    total = max(1, len(files) + 1)
+    for i, entry in enumerate(files):
+        _progress(
+            on_progress,
+            "delete_shard",
+            i,
+            total,
+            f"Deleting {PurePosixPath(entry['path']).name}…",
+        )
+        delete_file(entry["id"], on_progress=None)
+    folders_store.delete_folder_tree(folder_path)
+    _progress(on_progress, "done", total, total, "Done")
+    return {"path": folder_path, "deleted_files": len(files)}
+
+
 def get_file_detail(file_id: str) -> dict[str, Any]:
     index = vault_index.load_index()
     entry = vault_index.find_file(index, file_id)
@@ -124,6 +307,7 @@ def get_file_detail(file_id: str) -> dict[str, Any]:
         "mtime": entry.get("mtime"),
         "chunk_size": entry.get("chunk_size"),
         "alg": entry.get("crypto", {}).get("alg"),
+        "thumb_status": entry.get("thumb_status") or "none",
         "shard_count": len(shards),
         "shards_by_account": sorted(
             by_account.values(),
@@ -148,9 +332,20 @@ def get_file_detail(file_id: str) -> dict[str, Any]:
 
 
 def _list_entries_clean(index: dict[str, Any], base: str) -> list[dict[str, Any]]:
-    dirs: set[str] = set()
+    dirs: dict[str, dict[str, Any]] = {}
     files: list[dict[str, Any]] = []
     base_parts = () if base == "/" else tuple(p for p in PurePosixPath(base).parts if p != "/")
+
+    for child in folders_store.list_child_names(base):
+        dirs[child["name"]] = {
+            "id": child["id"],
+            "name": child["name"],
+            "path": child["path"],
+            "size": None,
+            "mtime": child.get("mtime"),
+            "kind": "dir",
+            "shard_count": 0,
+        }
 
     for entry in index.get("files", []):
         clean_parts = tuple(p for p in PurePosixPath(entry["path"]).parts if p != "/")
@@ -169,39 +364,34 @@ def _list_entries_clean(index: dict[str, Any], base: str) -> list[dict[str, Any]
                     "mtime": entry.get("mtime"),
                     "kind": "file",
                     "shard_count": len(entry.get("shards", [])),
+                    "thumb_status": entry.get("thumb_status") or "none",
                 }
             )
         else:
-            dirs.add(rest[0])
+            name = rest[0]
+            if name not in dirs:
+                path = f"{base.rstrip('/')}/{name}" if base != "/" else f"/{name}"
+                dirs[name] = {
+                    "id": f"dir:{path}",
+                    "name": name,
+                    "path": path,
+                    "size": None,
+                    "mtime": None,
+                    "kind": "dir",
+                    "shard_count": 0,
+                }
 
-    result: list[dict[str, Any]] = [
-        {
-            "id": f"dir:{base.rstrip('/')}/{name}" if base != "/" else f"dir:/{name}",
-            "name": name,
-            "path": f"{base.rstrip('/')}/{name}" if base != "/" else f"/{name}",
-            "size": None,
-            "mtime": None,
-            "kind": "dir",
-            "shard_count": 0,
-        }
-        for name in sorted(dirs)
-    ]
+    result: list[dict[str, Any]] = [dirs[name] for name in sorted(dirs)]
     result.extend(sorted(files, key=lambda f: f["name"]))
     return result
 
 
 def _normalize_dir(path: str) -> str:
-    if not path or path == "/":
-        return "/"
-    p = PurePosixPath("/" + path.strip("/"))
-    return str(p)
+    return folders_store.normalize_dir(path)
 
 
 def _join_path(dir_path: str, name: str) -> str:
-    base = _normalize_dir(dir_path)
-    if base == "/":
-        return f"/{name}"
-    return f"{base}/{name}"
+    return folders_store.join_path(dir_path, name)
 
 
 def _worker_count(n_tasks: int, *, download: bool = False) -> int:
@@ -278,14 +468,12 @@ def upload_file(
     ):
         raise ValueError("resume_from_byte must be a non-negative multiple of chunk_size")
 
-    account_list = accounts_store.load_accounts()
-    if not account_list:
-        raise ValueError("Connect at least one account before uploading")
+    account_list = accounts_store.require_enabled_accounts()
 
     # Capture for worker threads (ThreadPoolExecutor does not inherit contextvars).
     user_id = auth_context.require_user_id()
 
-    planner = PlacementPlanner.from_accounts(account_list)
+    planner = PlacementPlanner.from_accounts(account_list, user_id=user_id)
     providers_by_id = _providers_by_id(account_list)
 
     existing = upload_sessions.load(session_id) if session_id else None
@@ -347,6 +535,24 @@ def upload_file(
     else:
         expected_chunks = None
         total_steps = 1
+
+    # Soft per-account shard balance (skip when total shard count is unknown).
+    balance_cap = planner.configure_balance(expected_chunks)
+    seeded: dict[str, int] = {}
+    if shard_records:
+        for rec in shard_records.values():
+            aid = rec["account_id"]
+            seeded[aid] = seeded.get(aid, 0) + 1
+        planner.seed_shards(seeded)
+    if balance_cap is not None:
+        log.info(
+            "upload_file shard balance cap=%s placeable=%s expected_chunks=%s "
+            "seeded=%s",
+            balance_cap,
+            len(planner.placeable_accounts()),
+            expected_chunks,
+            seeded,
+        )
 
     done_bytes = 0
     if size is not None and size >= 0 and expected_chunks:
@@ -618,7 +824,53 @@ def upload_file(
     stream_bytes = 0
     pool = ThreadPoolExecutor(max_workers=workers)
     abort_exc: BaseException | None = None
-    chunk_iter = iter(chunks)
+    # Tee plaintext for thumbnail gen (only when streaming from byte 0).
+    # Video: prefix only (ffmpeg needs early frames). Office/image/pdf: full file.
+    # Unsupported / oversized office: skip spool.
+    spool_path: Path | None = None
+    spool_fp: Any = None
+    thumb_kind = classify_filename(filename)
+    spool_limit: int | None = None
+    want_spool = False
+    if resume_from_byte == 0 and thumb_kind != "unsupported":
+        if thumb_kind == "video":
+            want_spool = True
+            spool_limit = max(0, THUMB_VIDEO_SPOOL_BYTES)
+        elif thumb_kind == "office" and size is not None and size > THUMB_MAX_SOURCE_BYTES:
+            want_spool = False
+        else:
+            want_spool = True
+            spool_limit = None
+    if want_spool:
+        spool_dir = DATA_DIR / "tmp"
+        spool_dir.mkdir(parents=True, exist_ok=True)
+        spool_path = spool_dir / f"{file_id}.spool"
+        spool_fp = open(spool_path, "wb")
+
+        def _tee_chunks() -> Any:
+            assert spool_fp is not None
+            written = 0
+            try:
+                for piece in chunks:
+                    if not spool_fp.closed:
+                        if spool_limit is None:
+                            spool_fp.write(piece)
+                        elif written < spool_limit:
+                            take = min(len(piece), spool_limit - written)
+                            if take:
+                                spool_fp.write(piece[:take])
+                                written += take
+                            if written >= spool_limit:
+                                spool_fp.flush()
+                                spool_fp.close()
+                    yield piece
+            finally:
+                if not spool_fp.closed:
+                    spool_fp.close()
+
+        chunk_iter = iter(_tee_chunks())
+    else:
+        chunk_iter = iter(chunks)
     log.info(
         "upload_file start file=%s path=%s filename=%s size=%s chunk_size=%s "
         "workers=%s expected_chunks=%s resume_from_byte=%s done_shards=%s",
@@ -843,84 +1095,129 @@ def upload_file(
                 len(shard_records),
                 abort_exc,
             )
+        # Drop spool on failure/cancel; success path unlinks after thumb gen.
+        if abort_exc is not None or _aborted():
+            if spool_fp is not None and not spool_fp.closed:
+                try:
+                    spool_fp.close()
+                except Exception:
+                    pass
+            if spool_path is not None:
+                try:
+                    spool_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     if abort_exc is not None:
         raise abort_exc
     if _aborted():
         raise RuntimeError("Upload cancelled")
 
-    plaintext_size = resume_from_byte + stream_bytes
-    # Full re-stream from 0: stream_bytes is the whole file; resume_from_byte is 0.
-    # Offset resume: stream covers the suffix only.
-    if size is not None and size >= 0 and plaintext_size != size:
-        # Incomplete body cannot be indexed; keep session for resume (not cancel).
-        _persist_session(
-            status="failed",
-            error=(
+    try:
+        plaintext_size = resume_from_byte + stream_bytes
+        # Full re-stream from 0: stream_bytes is the whole file; resume_from_byte is 0.
+        # Offset resume: stream covers the suffix only.
+        if size is not None and size >= 0 and plaintext_size != size:
+            # Incomplete body cannot be indexed; keep session for resume (not cancel).
+            _persist_session(
+                status="failed",
+                error=(
+                    f"Upload truncated or oversized: received {plaintext_size} bytes, "
+                    f"expected {size} bytes"
+                ),
+            )
+            raise ValueError(
                 f"Upload truncated or oversized: received {plaintext_size} bytes, "
                 f"expected {size} bytes"
-            ),
-        )
-        raise ValueError(
-            f"Upload truncated or oversized: received {plaintext_size} bytes, "
-            f"expected {size} bytes"
-        )
-
-    if expected_chunks is not None:
-        missing = [i for i in range(expected_chunks) if i not in shard_records]
-        if missing:
-            _persist_session(status="failed", error=f"Missing shards: {missing[:8]}")
-            raise RuntimeError(
-                f"Upload incomplete: missing {len(missing)} shards (e.g. {missing[:5]})"
             )
-        ordered = [shard_records[i] for i in range(expected_chunks)]
-    else:
-        ordered = [shard_records[i] for i in range(chunk_index)]
 
-    if size is not None and size >= 0:
-        total_steps = max(1, size) + 1
-        final_size = size
-    else:
-        final_size = plaintext_size
-        total_steps = final_size + 1 if final_size > 0 else 2
+        if expected_chunks is not None:
+            missing = [i for i in range(expected_chunks) if i not in shard_records]
+            if missing:
+                _persist_session(status="failed", error=f"Missing shards: {missing[:8]}")
+                raise RuntimeError(
+                    f"Upload incomplete: missing {len(missing)} shards (e.g. {missing[:5]})"
+                )
+            ordered = [shard_records[i] for i in range(expected_chunks)]
+        else:
+            ordered = [shard_records[i] for i in range(chunk_index)]
 
-    _progress(on_progress, "index", total_steps - 1, total_steps, "Updating vault index…")
-    log.info(
-        "upload_file indexing file=%s shards=%s plaintext=%s",
-        file_id,
-        len(ordered),
-        final_size,
-    )
-    with folders_lock:
-        folders_snapshot = dict(remote_folders)
-    entry = {
-        "id": file_id,
-        "path": _join_path(dir_path, filename),
-        "size": final_size,
-        "mtime": int(time.time()),
-        "chunk_size": shard_size,
-        "crypto": {
-            "alg": crypto.ALG_CHUNK,
-            "wrapped_file_key": crypto.wrap_file_key(master_key, file_key),
-        },
-        "remote_folders": folders_snapshot,
-        "shards": ordered,
-    }
+        if size is not None and size >= 0:
+            total_steps = max(1, size) + 1
+            final_size = size
+        else:
+            final_size = plaintext_size
+            total_steps = final_size + 1 if final_size > 0 else 2
 
-    index = vault_index.load_index()
-    index["files"] = [f for f in index.get("files", []) if f["path"] != entry["path"]]
-    vault_index.upsert_file(index, entry)
-    vault_index.save_index(index)
-    upload_sessions.delete(file_id)
-    _progress(on_progress, "done", total_steps, total_steps, "Done")
-    log.info(
-        "upload_file complete file=%s path=%s size=%s shards=%s",
-        file_id,
-        entry["path"],
-        final_size,
-        len(ordered),
-    )
-    return entry
+        _progress(on_progress, "index", total_steps - 1, total_steps, "Updating vault index…")
+        log.info(
+            "upload_file indexing file=%s shards=%s plaintext=%s",
+            file_id,
+            len(ordered),
+            final_size,
+        )
+        with folders_lock:
+            folders_snapshot = dict(remote_folders)
+        entry = {
+            "id": file_id,
+            "path": _join_path(dir_path, filename),
+            "size": final_size,
+            "mtime": int(time.time()),
+            "chunk_size": shard_size,
+            "crypto": {
+                "alg": crypto.ALG_CHUNK,
+                "wrapped_file_key": crypto.wrap_file_key(master_key, file_key),
+            },
+            "remote_folders": folders_snapshot,
+            "shards": ordered,
+        }
+
+        parent = _normalize_dir(dir_path)
+        if parent != "/":
+            folders_store.ensure_folder(parent)
+
+        index = vault_index.load_index()
+        index["files"] = [f for f in index.get("files", []) if f["path"] != entry["path"]]
+        entry["thumb_status"] = "none"
+        vault_index.upsert_file(index, entry)
+        vault_index.save_index(index)
+        upload_sessions.delete(file_id)
+
+        _progress(on_progress, "thumbnail", total_steps, total_steps, "Generating thumbnail…")
+        attach_after_upload(
+            file_id=file_id,
+            filename=filename,
+            spool_path=spool_path,
+            master_key=master_key,
+            remote_folders=folders_snapshot,
+            accounts=account_list,
+        )
+
+        refreshed = vault_index.find_file(None, file_id) or entry
+        entry["thumb_status"] = refreshed.get("thumb_status") or "none"
+        entry["thumb"] = refreshed.get("thumb")
+
+        _progress(on_progress, "done", total_steps, total_steps, "Done")
+        log.info(
+            "upload_file complete file=%s path=%s size=%s shards=%s thumb=%s",
+            file_id,
+            entry["path"],
+            final_size,
+            len(ordered),
+            entry.get("thumb_status"),
+        )
+        return entry
+    finally:
+        if spool_fp is not None and not spool_fp.closed:
+            try:
+                spool_fp.close()
+            except Exception:
+                pass
+        if spool_path is not None:
+            try:
+                spool_path.unlink(missing_ok=True)
+            except Exception:
+                log.exception("spool cleanup failed file=%s path=%s", file_id, spool_path)
 
 
 def upload_file_from_stream(
@@ -1258,9 +1555,14 @@ def delete_file(file_id: str, on_progress: ProgressFn | None = None) -> None:
 
     shard_list = entry.get("shards", [])
     remote_folders = entry.get("remote_folders") or {}
+    thumb = entry.get("thumb") or {}
+    thumb_account_id = thumb.get("account_id")
+    thumb_remote_id = thumb.get("remote_id")
     account_list = accounts_store.load_accounts()
     account_map = {a["id"]: a for a in account_list}
     needed_ids = set(remote_folders) | {s["account_id"] for s in shard_list}
+    if thumb_account_id:
+        needed_ids.add(thumb_account_id)
     providers_by_id = _providers_by_id([a for a in account_list if a["id"] in needed_ids])
     done_count = 0
     progress_lock = threading.Lock()
@@ -1321,6 +1623,18 @@ def delete_file(file_id: str, on_progress: ProgressFn | None = None) -> None:
             _progress(on_progress, "delete_shard", 0, total_steps, "Deleting shards…")
             with ThreadPoolExecutor(max_workers=_worker_count(len(shard_list))) as pool:
                 list(pool.map(_delete_one, shard_list))
+
+    # Root-level / cross-account thumbs are not removed by per-file folder delete.
+    if (
+        thumb_remote_id
+        and thumb_account_id
+        and thumb_account_id not in remote_folders
+        and thumb_account_id in providers_by_id
+    ):
+        try:
+            providers_by_id[thumb_account_id].delete(thumb_remote_id)
+        except Exception:
+            pass
 
     _progress(on_progress, "index", total_steps - 1, total_steps, "Updating vault index…")
     vault_index.save_index(index)

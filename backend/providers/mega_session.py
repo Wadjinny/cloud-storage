@@ -5,7 +5,7 @@ import logging
 import threading
 import time
 from collections.abc import Awaitable, Callable
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from mega.client import MegaNzClient
 
@@ -150,6 +150,48 @@ class MegaAccountSession:
             pass
         folder = await client._core.mkdir(file_id, parent_id)
         return folder.id
+
+    @staticmethod
+    def _node_name(node: Any) -> str:
+        """MEGA Node display name lives on ``attributes.name``, not ``node.name``."""
+        attrs = getattr(node, "attributes", None)
+        if attrs is not None:
+            name = getattr(attrs, "name", None)
+            if name:
+                return str(name)
+        return str(getattr(node, "id", ""))
+
+    async def _list_vault_children(self, client: MegaNzClient) -> list[dict[str, str]]:
+        root_id = await self._ensure_folder(client)
+        fs = await client.get_filesystem()
+        child_ids = getattr(fs, "children", {}).get(root_id, ())
+        nodes = getattr(fs, "nodes", None)
+        out: list[dict[str, str]] = []
+        if nodes is not None:
+            for child_id in child_ids:
+                node = nodes.get(child_id)
+                if node is None:
+                    continue
+                out.append(
+                    {
+                        "id": str(node.id),
+                        "name": self._node_name(node),
+                        "kind": "folder" if node.is_folder else "file",
+                    }
+                )
+            return out
+        # Fallback: scan mapping-like filesystem
+        for node in fs.values():
+            if getattr(node, "parent_id", None) != root_id:
+                continue
+            out.append(
+                {
+                    "id": str(node.id),
+                    "name": self._node_name(node),
+                    "kind": "folder" if getattr(node, "is_folder", False) else "file",
+                }
+            )
+        return out
 
     async def _run_op(self, op: CoroFn[T]) -> T:
         client = await self._acquire()

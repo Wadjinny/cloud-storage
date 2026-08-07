@@ -103,3 +103,15 @@ def open_json(key: bytes, sealed: str) -> Any:
     nonce, ciphertext = raw[:NONCE_LEN], raw[NONCE_LEN:]
     plaintext = decrypt(key, ciphertext, nonce)
     return json.loads(plaintext.decode("utf-8"))
+
+
+def seal_bytes(key: bytes, plaintext: bytes) -> bytes:
+    """Encrypt to an opaque binary blob: nonce || ciphertext(+tag)."""
+    ciphertext, nonce = encrypt(key, plaintext)
+    return nonce + ciphertext
+
+
+def open_bytes(key: bytes, blob: bytes) -> bytes:
+    """Decrypt a blob produced by seal_bytes."""
+    nonce, ciphertext = blob[:NONCE_LEN], blob[NONCE_LEN:]
+    return decrypt(key, ciphertext, nonce)

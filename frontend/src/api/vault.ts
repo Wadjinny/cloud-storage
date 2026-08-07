@@ -1,3 +1,8 @@
+import {
+  ensureDownloadFolder,
+  supportsDownloadFolder,
+  writeToDownloadFolder,
+} from '../downloadFolder'
 import { apiUrl } from './base'
 
 export type VaultStatus = {
@@ -6,7 +11,13 @@ export type VaultStatus = {
   initialized: boolean
   file_count: number
   account_count: number
+  /** True while a user-level job/transfer locks provider account management. */
+  accounts_locked?: boolean
+  /** Max parallel shard uploads; also the batch file-upload worker count. */
+  shard_upload_concurrency?: number
 }
+
+export type ThumbStatus = 'none' | 'ready' | 'failed' | 'unsupported' | string
 
 export type VaultEntry = {
   id: string
@@ -16,6 +27,7 @@ export type VaultEntry = {
   size: number | null
   mtime: number | null
   shard_count: number
+  thumb_status?: ThumbStatus
 }
 
 export type VaultFileDetail = {
@@ -26,6 +38,7 @@ export type VaultFileDetail = {
   mtime: number | null
   chunk_size: number | null
   alg: string | null
+  thumb_status?: ThumbStatus
   shard_count: number
   shards_by_account: Array<{
     account_id: string
@@ -91,6 +104,7 @@ export type TransferJob = {
     size?: number
     shard_count?: number
     resume?: UploadResumeInfo
+    [key: string]: unknown
   } | null
   filename?: string | null
   stats?: UploadJobStats | null
@@ -138,6 +152,48 @@ export async function lockVault(): Promise<void> {
   if (!res.ok) throw new Error(await readError(res))
 }
 
+export async function mkdirVault(parent: string, name: string): Promise<VaultEntry> {
+  const res = await fetch(apiUrl('/api/vault/mkdir'), {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ parent, name }),
+  })
+  if (!res.ok) throw new Error(await readError(res))
+  return res.json() as Promise<VaultEntry>
+}
+
+export async function moveVaultEntry(
+  srcPath: string,
+  destPath: string,
+  kind?: 'file' | 'dir',
+): Promise<VaultEntry> {
+  const res = await fetch(apiUrl('/api/vault/move'), {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ src_path: srcPath, dest_path: destPath, kind }),
+  })
+  if (!res.ok) throw new Error(await readError(res))
+  return res.json() as Promise<VaultEntry>
+}
+
+export async function deleteVaultDir(
+  path: string,
+  onProgress?: (update: ProgressUpdate) => void,
+): Promise<void> {
+  onProgress?.({ percent: 0, message: 'Starting folder delete…', phase: 'queued' })
+  const res = await fetch(apiUrl('/api/vault/dirs/delete'), {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path }),
+  })
+  if (!res.ok) throw new Error(await readError(res))
+  const { job_id: jobId } = (await res.json()) as { job_id: string }
+  await waitForJob(jobId, onProgress)
+}
+
 export async function listVaultFiles(path: string): Promise<VaultEntry[]> {
   const qs = new URLSearchParams({ path })
   const res = await fetch(apiUrl(`/api/vault/files?${qs}`), { credentials: 'include' })
@@ -153,7 +209,17 @@ export async function getVaultFile(id: string): Promise<VaultFileDetail> {
   return res.json() as Promise<VaultFileDetail>
 }
 
-async function waitForJob(
+/** Fetch decrypted thumbnail bytes (credentialed; for blob URL display). */
+export async function fetchVaultThumbnail(id: string): Promise<Blob> {
+  const res = await fetch(
+    apiUrl(`/api/vault/files/${encodeURIComponent(id)}/thumbnail`),
+    { credentials: 'include' },
+  )
+  if (!res.ok) throw new Error(await readError(res))
+  return res.blob()
+}
+
+export async function waitForJob(
   jobId: string,
   onProgress?: (update: ProgressUpdate) => void,
   signal?: AbortSignal,
@@ -330,85 +396,35 @@ export async function uploadVaultFile(
   }
 }
 
-export async function downloadVaultFile(
-  id: string,
-  filename: string,
+async function runDownloadStreamJob(
+  jobId: string,
+  saveName: string,
   onProgress?: (update: ProgressUpdate) => void,
-  opts?: { signal?: AbortSignal },
+  opts?: { signal?: AbortSignal; directory?: FileSystemDirectoryHandle | null },
 ): Promise<void> {
   const signal = opts?.signal
-  onProgress?.({ percent: 0, message: 'Starting download…', phase: 'queued' })
-  const qs = new URLSearchParams({ id })
-  const res = await fetch(apiUrl(`/api/vault/download?${qs}`), {
-    method: 'POST',
-    credentials: 'include',
-    signal,
-  })
-  if (!res.ok) throw new Error(await readError(res))
-  const started = (await res.json()) as {
-    job_id: string
-    filename?: string
-    size?: number | null
+  let dir: FileSystemDirectoryHandle | null = opts?.directory ?? null
+  if (dir == null && supportsDownloadFolder()) {
+    dir = await ensureDownloadFolder()
+    if (!dir) throw new Error('Download cancelled')
   }
-  const jobId = started.job_id
-  const saveName = started.filename || filename
-  const streamUrl = apiUrl(`/api/vault/download/${encodeURIComponent(jobId)}/stream`)
+  if (signal?.aborted) throw new Error('Download cancelled')
 
+  const streamUrl = apiUrl(`/api/vault/download/${encodeURIComponent(jobId)}/stream`)
   const onAbort = () => {
     void cancelDownloadJob(jobId)
   }
   signal?.addEventListener('abort', onAbort)
   const events = waitForJob(jobId, onProgress, signal)
 
-  type SaveWritable = {
-    write: (chunk: Uint8Array) => Promise<void>
-    close: () => Promise<void>
-    abort: () => Promise<void>
-  }
-  const picker = (
-    window as Window & {
-      showSaveFilePicker?: (opts: { suggestedName?: string }) => Promise<{
-        createWritable: () => Promise<SaveWritable>
-      }>
-    }
-  ).showSaveFilePicker
-
   try {
-    if (typeof picker === 'function') {
-      let writable: SaveWritable | null = null
-      let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
+    if (dir) {
       try {
-        const handle = await picker({ suggestedName: saveName })
-        if (signal?.aborted) throw new Error('Download cancelled')
-        writable = await handle.createWritable()
         const streamRes = await fetch(streamUrl, { credentials: 'include', signal })
         if (!streamRes.ok) throw new Error(await readError(streamRes))
         if (!streamRes.body) throw new Error('Download stream unavailable')
-        reader = streamRes.body.getReader()
-        for (;;) {
-          if (signal?.aborted) throw new Error('Download cancelled')
-          const { done, value } = await reader.read()
-          if (done) break
-          if (value) await writable.write(value)
-        }
-        await writable.close()
-        writable = null
-        reader = null
+        await writeToDownloadFolder(dir, saveName, streamRes.body, signal)
       } catch (err) {
-        if (reader) {
-          try {
-            await reader.cancel()
-          } catch {
-            /* ignore */
-          }
-        }
-        if (writable) {
-          try {
-            await writable.abort()
-          } catch {
-            /* ignore */
-          }
-        }
         await cancelDownloadJob(jobId)
         if (
           (err instanceof DOMException && err.name === 'AbortError') ||
@@ -420,7 +436,7 @@ export async function downloadVaultFile(
         try {
           await events
         } catch {
-          /* prefer stream/picker error */
+          /* prefer stream error */
         }
         throw err
       }
@@ -455,6 +471,81 @@ export async function downloadVaultFile(
   } finally {
     signal?.removeEventListener('abort', onAbort)
   }
+}
+
+export async function downloadVaultFile(
+  id: string,
+  filename: string,
+  onProgress?: (update: ProgressUpdate) => void,
+  opts?: { signal?: AbortSignal; directory?: FileSystemDirectoryHandle | null },
+): Promise<void> {
+  const signal = opts?.signal
+  onProgress?.({ percent: 0, message: 'Starting download…', phase: 'queued' })
+
+  // Resolve save location before starting the server job (pick once, reuse).
+  let directory: FileSystemDirectoryHandle | null | undefined = opts?.directory
+  if (directory === undefined && supportsDownloadFolder()) {
+    directory = await ensureDownloadFolder()
+    if (!directory) throw new Error('Download cancelled')
+  }
+  if (signal?.aborted) throw new Error('Download cancelled')
+
+  const qs = new URLSearchParams({ id })
+  const res = await fetch(apiUrl(`/api/vault/download?${qs}`), {
+    method: 'POST',
+    credentials: 'include',
+    signal,
+  })
+  if (!res.ok) throw new Error(await readError(res))
+  const started = (await res.json()) as {
+    job_id: string
+    filename?: string
+    size?: number | null
+  }
+  await runDownloadStreamJob(started.job_id, started.filename || filename, onProgress, {
+    signal,
+    directory: directory ?? null,
+  })
+}
+
+export type ZipDownloadItem = {
+  kind: 'file' | 'dir'
+  path: string
+  id?: string
+}
+
+export async function downloadVaultZip(
+  items: ZipDownloadItem[],
+  onProgress?: (update: ProgressUpdate) => void,
+  opts?: { signal?: AbortSignal; directory?: FileSystemDirectoryHandle | null },
+): Promise<void> {
+  const signal = opts?.signal
+  onProgress?.({ percent: 0, message: 'Starting zip download…', phase: 'queued' })
+
+  let directory: FileSystemDirectoryHandle | null | undefined = opts?.directory
+  if (directory === undefined && supportsDownloadFolder()) {
+    directory = await ensureDownloadFolder()
+    if (!directory) throw new Error('Download cancelled')
+  }
+  if (signal?.aborted) throw new Error('Download cancelled')
+
+  const res = await fetch(apiUrl('/api/vault/download/zip'), {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items }),
+    signal,
+  })
+  if (!res.ok) throw new Error(await readError(res))
+  const started = (await res.json()) as {
+    job_id: string
+    filename?: string
+    file_count?: number
+  }
+  await runDownloadStreamJob(started.job_id, started.filename || 'vault.zip', onProgress, {
+    signal,
+    directory: directory ?? null,
+  })
 }
 
 export async function deleteVaultFile(

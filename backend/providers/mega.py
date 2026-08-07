@@ -35,6 +35,14 @@ class MegaProvider:
 
         return session.run(_ensure)
 
+    def list_vault_children(self) -> list[dict[str, str]]:
+        session = self._session()
+
+        async def _list(client: MegaNzClient) -> list[dict[str, str]]:
+            return await session._list_vault_children(client)
+
+        return session.run(_list)
+
     def upload(self, remote_id: str, data: bytes, *, parent_id: str | None = None) -> str:
         session = self._session()
         log.info("mega upload start name=%s bytes=%s email=%s", remote_id, len(data), self._email)
@@ -92,6 +100,19 @@ class MegaProvider:
                 return Path(out).read_bytes()
 
         return session.run(_download)
+
+    def exists(self, remote_id: str) -> bool:
+        session = self._session()
+
+        async def _exists(client: MegaNzClient) -> bool:
+            fs = await client.get_filesystem()
+            try:
+                _ = fs[remote_id]
+                return True
+            except (KeyError, FileNotFoundError, TypeError):
+                return False
+
+        return session.run(_exists)
 
     def delete(self, remote_id: str) -> None:
         session = self._session()

@@ -4,21 +4,23 @@ import asyncio
 import json
 import logging
 import queue
-import threading
 import time
 from pathlib import PurePosixPath
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.requests import ClientDisconnect
 
-from config import choose_chunk_size
+from config import THUMB_CACHE_MAX_AGE, choose_chunk_size
 from deps import require_unlocked
 from services import vault as vault_service
+from services import zip_download as zip_download_service
+from services.account_lock import accounts_manageable
 from services.download_session import download_sessions
 from services.jobs import jobs
+from services.thumbnails import load_thumbnail_bytes
 from services.upload_pipeline import UploadCancelled, upload_pipelines
 from storage import accounts as accounts_store
 from storage import auth_context
@@ -40,8 +42,34 @@ class UploadResumeBody(BaseModel):
     session_id: str = Field(min_length=1)
 
 
+class MkdirBody(BaseModel):
+    parent: str = Field(default="/")
+    name: str = Field(min_length=1, max_length=255)
+
+
+class MoveBody(BaseModel):
+    src_path: str = Field(min_length=1)
+    dest_path: str = Field(min_length=1)
+    kind: str | None = Field(default=None, description="'file' or 'dir'")
+
+
+class ZipItemBody(BaseModel):
+    kind: str = Field(description="'file' or 'dir'")
+    path: str = Field(min_length=1)
+    id: str | None = Field(default=None, description="File id when kind=file")
+
+
+class ZipDownloadBody(BaseModel):
+    items: list[ZipItemBody] = Field(min_length=1)
+
+
+class DeleteDirBody(BaseModel):
+    path: str = Field(min_length=1)
+
+
 @router.get("/status")
 def vault_status(request: Request) -> dict[str, bool | int | str | None]:
+    from config import SHARD_UPLOAD_CONCURRENCY
     from services import crypto
 
     unlocked = bool(request.session.get("vault_unlocked"))
@@ -60,6 +88,8 @@ def vault_status(request: Request) -> dict[str, bool | int | str | None]:
                     "initialized": users_store.user_count() > 0,
                     "file_count": vault_index.count_files(),
                     "account_count": accounts_store.count_accounts(),
+                    "accounts_locked": not accounts_manageable(str(user_id)),
+                    "shard_upload_concurrency": SHARD_UPLOAD_CONCURRENCY,
                 }
     return {
         "unlocked": False,
@@ -67,6 +97,8 @@ def vault_status(request: Request) -> dict[str, bool | int | str | None]:
         "initialized": users_store.user_count() > 0,
         "file_count": 0,
         "account_count": 0,
+        "accounts_locked": False,
+        "shard_upload_concurrency": SHARD_UPLOAD_CONCURRENCY,
     }
 
 
@@ -90,6 +122,56 @@ def list_files(
     return vault_service.list_entries(path)
 
 
+@router.post("/mkdir")
+def mkdir(request: Request, body: MkdirBody) -> dict:
+    require_unlocked(request)
+    try:
+        return vault_service.mkdir(body.parent, body.name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/move")
+def move_entry(request: Request, body: MoveBody) -> dict:
+    require_unlocked(request)
+    try:
+        return vault_service.move_entry(
+            src_path=body.src_path,
+            dest_path=body.dest_path,
+            kind=body.kind,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/dirs/delete")
+def delete_dir(request: Request, body: DeleteDirBody) -> dict:
+    from storage import folders as folders_store
+
+    master_key = require_unlocked(request)
+    user_id = auth_context.require_user_id()
+    norm = folders_store.normalize_dir(body.path)
+    if norm == "/":
+        raise HTTPException(status_code=400, detail="Cannot delete root")
+    if (
+        folders_store.get_folder(norm) is None
+        and not vault_index.list_files_under_prefix(norm)
+        and not folders_store.list_child_names(norm)
+    ):
+        raise HTTPException(status_code=404, detail="Folder not found")
+
+    job_id = jobs.run_in_thread(
+        "delete",
+        user_id=user_id,
+        master_key=master_key,
+        work=lambda on_progress: vault_service.delete_directory(body.path, on_progress),
+        queued_message="Starting folder delete…",
+    )
+    return {"job_id": job_id}
+
+
 @router.get("/files/{file_id}")
 def get_file(
     request: Request,
@@ -100,6 +182,36 @@ def get_file(
         return vault_service.get_file_detail(file_id)
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/files/{file_id}/thumbnail")
+def get_file_thumbnail(request: Request, file_id: str) -> Response:
+    master_key = require_unlocked(request)
+    entry = vault_index.find_file(None, file_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="File not found")
+    status = entry.get("thumb_status") or "none"
+    if status != "ready":
+        raise HTTPException(status_code=404, detail="Thumbnail not available")
+    try:
+        data = load_thumbnail_bytes(entry, master_key)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        log.exception("thumbnail load failed file=%s", file_id)
+        raise HTTPException(status_code=502, detail="Thumbnail fetch failed") from exc
+
+    thumb = entry.get("thumb") or {}
+    remote_id = thumb.get("remote_id") or ""
+    etag = f'"{remote_id}:{thumb.get("bytes") or len(data)}"'
+    return Response(
+        content=data,
+        media_type=thumb.get("mime") or "image/webp",
+        headers={
+            "Cache-Control": f"private, max-age={THUMB_CACHE_MAX_AGE}",
+            "ETag": etag,
+        },
+    )
 
 
 @router.get("/jobs/{job_id}")
@@ -149,18 +261,6 @@ async def job_events(request: Request, job_id: str) -> StreamingResponse:
     )
 
 
-def _run_delete_job(job_id: str, file_id: str, user_id: str, master_key: bytes) -> None:
-    def on_progress(phase: str, current: int, total: int, message: str) -> None:
-        jobs.update(job_id, phase=phase, current=current, total=total, message=message)
-
-    with auth_context.auth_scope(user_id, master_key):
-        try:
-            vault_service.delete_file(file_id, on_progress)
-            jobs.complete(job_id)
-        except Exception as exc:
-            jobs.fail(job_id, str(exc))
-
-
 @router.post("/upload/start")
 async def upload_start(
     request: Request,
@@ -169,10 +269,12 @@ async def upload_start(
 ) -> dict:
     master_key = require_unlocked(request)
     user_id = auth_context.require_user_id()
-    if not accounts_store.load_accounts():
-        raise HTTPException(status_code=400, detail="Connect at least one account before uploading")
+    try:
+        accounts_store.require_enabled_accounts()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    job = jobs.create("upload")
+    job = jobs.create("upload", user_id=user_id)
     total = max(1, body.size) + 1 if body.size is not None else 1
     chunk_size = choose_chunk_size(body.size)
     jobs.update(job.id, phase="queued", message="Waiting for file stream…", current=0, total=total)
@@ -206,8 +308,10 @@ async def upload_resume(request: Request, body: UploadResumeBody) -> dict:
     """Continue a failed upload session (skips shards already on providers)."""
     master_key = require_unlocked(request)
     user_id = auth_context.require_user_id()
-    if not accounts_store.load_accounts():
-        raise HTTPException(status_code=400, detail="Connect at least one account before uploading")
+    try:
+        accounts_store.require_enabled_accounts()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     session = upload_sessions.load(body.session_id)
     if session is None:
@@ -218,7 +322,7 @@ async def upload_resume(request: Request, body: UploadResumeBody) -> dict:
     resume_from = upload_sessions.resume_from_byte(session)
     size = session.get("size")
     chunk_size = int(session["chunk_size"])
-    job = jobs.create("upload")
+    job = jobs.create("upload", user_id=user_id)
     total = max(1, int(size)) + 1 if size is not None else 1
     jobs.update(
         job.id,
@@ -428,7 +532,7 @@ async def start_download(request: Request, id: str = Query(...)) -> dict:
     filename = PurePosixPath(entry["path"]).name
     size = entry.get("size")
     shard_count = len(entry.get("shards", []))
-    job = jobs.create("download")
+    job = jobs.create("download", user_id=user_id)
     jobs.update(
         job.id,
         phase="queued",
@@ -443,8 +547,49 @@ async def start_download(request: Request, id: str = Query(...)) -> dict:
         master_key=master_key,
         filename=filename,
         size=size if isinstance(size, int) else None,
+        kind="file",
     )
     return {"job_id": job.id, "filename": filename, "size": size}
+
+
+@router.post("/download/zip")
+async def start_zip_download(request: Request, body: ZipDownloadBody) -> dict:
+    """Stream a multi-file/folder selection as a light (level-0) ZIP."""
+    master_key = require_unlocked(request)
+    user_id = auth_context.require_user_id()
+    try:
+        zip_filename, members, empty_dirs = zip_download_service.resolve_zip_selection(
+            [item.model_dump() for item in body.items]
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    job = jobs.create("download", user_id=user_id)
+    jobs.update(
+        job.id,
+        phase="queued",
+        message="Waiting for zip stream…",
+        current=0,
+        total=max(1, len(members)),
+    )
+    download_sessions.start(
+        job_id=job.id,
+        user_id=user_id,
+        master_key=master_key,
+        filename=zip_filename,
+        size=None,
+        kind="zip",
+        zip_members=members,
+        zip_empty_dirs=empty_dirs,
+    )
+    return {
+        "job_id": job.id,
+        "filename": zip_filename,
+        "file_count": len(members),
+        "size": None,
+    }
 
 
 @router.post("/download/{job_id}/cancel")
@@ -491,27 +636,40 @@ def download_stream(request: Request, job_id: str) -> StreamingResponse:
             stats=stats,
         )
 
+    def _aborted() -> bool:
+        return session.cancel_requested.is_set() or jobs.is_cancel_requested(job_id)
+
     def generate():
         with auth_context.auth_scope(session.user_id, session.master_key):
             try:
-                if session.cancel_requested.is_set():
+                if _aborted():
                     jobs.request_cancel(job_id, "Download cancelled")
                     return
-                for chunk in vault_service.iter_download(
-                    session.master_key,
-                    session.file_id,
-                    on_progress,
-                    should_abort=lambda: (
-                        session.cancel_requested.is_set()
-                        or jobs.is_cancel_requested(job_id)
-                    ),
-                ):
-                    if session.cancel_requested.is_set() or jobs.is_cancel_requested(job_id):
+                if session.kind == "zip":
+                    chunks = zip_download_service.iter_zip_download(
+                        session.master_key,
+                        session.zip_members or [],
+                        session.zip_empty_dirs or [],
+                        on_progress,
+                        should_abort=_aborted,
+                        user_id=session.user_id,
+                    )
+                else:
+                    if not session.file_id:
+                        raise RuntimeError("Download session missing file_id")
+                    chunks = vault_service.iter_download(
+                        session.master_key,
+                        session.file_id,
+                        on_progress,
+                        should_abort=_aborted,
+                    )
+                for chunk in chunks:
+                    if _aborted():
                         jobs.request_cancel(job_id, "Download cancelled")
                         log.info("download cancelled job_id=%s", job_id)
                         return
                     yield chunk
-                if session.cancel_requested.is_set() or jobs.is_cancel_requested(job_id):
+                if _aborted():
                     jobs.request_cancel(job_id, "Download cancelled")
                     log.info("download cancelled job_id=%s", job_id)
                     return
@@ -525,7 +683,7 @@ def download_stream(request: Request, job_id: str) -> StreamingResponse:
                 log.info("download cancelled job_id=%s", job_id)
                 return
             except Exception as exc:
-                if session.cancel_requested.is_set() or jobs.is_cancel_requested(job_id):
+                if _aborted():
                     jobs.request_cancel(job_id, "Download cancelled")
                     log.info("download cancelled job_id=%s", job_id)
                     return
@@ -536,6 +694,7 @@ def download_stream(request: Request, job_id: str) -> StreamingResponse:
             finally:
                 download_sessions.finish(job_id)
 
+    media = "application/zip" if session.kind == "zip" else "application/octet-stream"
     headers = {
         "Content-Disposition": f'attachment; filename="{session.filename}"',
         "Cache-Control": "no-store",
@@ -545,7 +704,7 @@ def download_stream(request: Request, job_id: str) -> StreamingResponse:
 
     return StreamingResponse(
         generate(),
-        media_type="application/octet-stream",
+        media_type=media,
         headers=headers,
     )
 
@@ -558,12 +717,11 @@ async def delete_file(request: Request, file_id: str) -> dict:
     if vault_index.find_file(index, file_id) is None:
         raise HTTPException(status_code=404, detail="File not found")
 
-    job = jobs.create("delete")
-    jobs.update(job.id, phase="queued", message="Starting delete…", current=0, total=1)
-    thread = threading.Thread(
-        target=_run_delete_job,
-        args=(job.id, file_id, user_id, master_key),
-        daemon=True,
+    job_id = jobs.run_in_thread(
+        "delete",
+        user_id=user_id,
+        master_key=master_key,
+        work=lambda on_progress: vault_service.delete_file(file_id, on_progress),
+        queued_message="Starting delete…",
     )
-    thread.start()
-    return {"job_id": job.id}
+    return {"job_id": job_id}

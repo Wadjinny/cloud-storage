@@ -20,18 +20,20 @@ def create_user(username: str, passphrase: str) -> dict[str, Any]:
         raise ValueError("Passphrase is required")
     salt = crypto.new_salt()
     master_key = crypto.derive_master_key(passphrase, salt)
+    now = int(time.time())
     user = {
         "id": f"usr_{secrets.token_hex(8)}",
         "username": username,
         "kdf_salt": crypto.b64e(salt),
         "verifier": crypto.make_verifier(master_key),
-        "created_at": int(time.time()),
+        "created_at": now,
+        "updated_at": now,
     }
     with connect() as conn:
         conn.execute(
             """
-            INSERT INTO users (id, username, kdf_salt, verifier, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO users (id, username, kdf_salt, verifier, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 user["id"],
@@ -39,6 +41,7 @@ def create_user(username: str, passphrase: str) -> dict[str, Any]:
                 user["kdf_salt"],
                 user["verifier"],
                 user["created_at"],
+                user["updated_at"],
             ),
         )
     return user
@@ -47,7 +50,10 @@ def create_user(username: str, passphrase: str) -> dict[str, Any]:
 def get_by_username(username: str) -> dict[str, Any] | None:
     with connect() as conn:
         row = conn.execute(
-            "SELECT id, username, kdf_salt, verifier, created_at FROM users WHERE username = ?",
+            """
+            SELECT id, username, kdf_salt, verifier, created_at, updated_at
+            FROM users WHERE username = ?
+            """,
             (username.strip(),),
         ).fetchone()
     return dict(row) if row else None
@@ -56,7 +62,10 @@ def get_by_username(username: str) -> dict[str, Any] | None:
 def get_by_id(user_id: str) -> dict[str, Any] | None:
     with connect() as conn:
         row = conn.execute(
-            "SELECT id, username, kdf_salt, verifier, created_at FROM users WHERE id = ?",
+            """
+            SELECT id, username, kdf_salt, verifier, created_at, updated_at
+            FROM users WHERE id = ?
+            """,
             (user_id,),
         ).fetchone()
     return dict(row) if row else None

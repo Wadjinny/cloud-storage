@@ -35,7 +35,7 @@ def bounded_client(data_dir, real_chunks, memory_account, monkeypatch: pytest.Mo
 
     jobs._jobs.clear()
     jobs._subs.clear()
-    upload_pipelines._pipelines.clear()
+    upload_pipelines.reset_live_slots()
     download_sessions._sessions.clear()
 
     with TestClient(app) as client:

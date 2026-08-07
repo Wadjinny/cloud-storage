@@ -74,6 +74,13 @@ STORAGE_FULL_RATIO = float(_raw_full)
 if STORAGE_FULL_RATIO > 1:
     STORAGE_FULL_RATIO /= 100.0
 STORAGE_FULL_RATIO = min(1.0, max(0.01, STORAGE_FULL_RATIO))
+# Soft per-account shard cap during placement: ceil(total/placeable)* (1+slack).
+# 0.2 or 20 both mean 20%. Set to 0 for a hard equal split (still ceil).
+_raw_slack = os.environ.get("SHARD_BALANCE_SLACK", "0.2").strip()
+SHARD_BALANCE_SLACK = float(_raw_slack)
+if SHARD_BALANCE_SLACK > 1:
+    SHARD_BALANCE_SLACK /= 100.0
+SHARD_BALANCE_SLACK = max(0.0, SHARD_BALANCE_SLACK)
 # Max parallel MEGA clients (logins) reused per account for uploads.
 # Keep at 1 even when SHARD_UPLOAD_CONCURRENCY>1: MEGA rate-limits parallel same-account uploads.
 MEGA_ACCOUNT_UPLOAD_CONCURRENCY = int(os.environ.get("MEGA_ACCOUNT_UPLOAD_CONCURRENCY", "1"))
@@ -95,6 +102,17 @@ MEGA_SESSION_TTL_SECONDS = int(os.environ.get("MEGA_SESSION_TTL_SECONDS", "600")
 PROVIDER_OP_TIMEOUT = int(os.environ.get("PROVIDER_OP_TIMEOUT", "120"))
 # Remote folder name for opaque shards on Drive / MEGA (created if missing).
 SHARD_FOLDER_NAME = os.environ.get("SHARD_FOLDER_NAME", "cloud-storage-vault")
+# Encrypted thumbnail: browser Cache-Control max-age (seconds).
+THUMB_CACHE_MAX_AGE = int(os.environ.get("THUMB_CACHE_MAX_AGE", "86400"))
+# Max thumbnail edge length in pixels.
+THUMB_MAX_EDGE = int(os.environ.get("THUMB_MAX_EDGE", "256"))
+# Skip office thumb generation above this plaintext size (bytes). Office needs
+# the full file; video does not (see THUMB_VIDEO_SPOOL_BYTES).
+THUMB_MAX_SOURCE_BYTES = int(os.environ.get("THUMB_MAX_SOURCE_BYTES", str(100 * 1024 * 1024)))
+# Max plaintext prefix teed for video thumbnails (ffmpeg only needs early frames).
+THUMB_VIDEO_SPOOL_BYTES = int(os.environ.get("THUMB_VIDEO_SPOOL_BYTES", str(32 * 1024 * 1024)))
+# Hard timeout for ffmpeg / LibreOffice / rasterize (seconds).
+THUMB_GEN_TIMEOUT = int(os.environ.get("THUMB_GEN_TIMEOUT", "60"))
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/userinfo.email",
