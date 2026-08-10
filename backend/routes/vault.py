@@ -23,6 +23,7 @@ from services.jobs import jobs
 from services.thumbnails import load_thumbnail_bytes
 from services.upload_pipeline import UploadCancelled, upload_pipelines
 from storage import accounts as accounts_store
+from storage import activity as activity_store
 from storage import auth_context
 from storage import upload_sessions
 from storage import users as users_store
@@ -69,7 +70,7 @@ class DeleteDirBody(BaseModel):
 
 @router.get("/status")
 def vault_status(request: Request) -> dict[str, bool | int | str | None]:
-    from config import SHARD_UPLOAD_CONCURRENCY
+    from config import PREVIEW_MAX_BYTES, SHARD_UPLOAD_CONCURRENCY
     from services import crypto
 
     unlocked = bool(request.session.get("vault_unlocked"))
@@ -90,6 +91,7 @@ def vault_status(request: Request) -> dict[str, bool | int | str | None]:
                     "account_count": accounts_store.count_accounts(),
                     "accounts_locked": not accounts_manageable(str(user_id)),
                     "shard_upload_concurrency": SHARD_UPLOAD_CONCURRENCY,
+                    "preview_max_bytes": PREVIEW_MAX_BYTES,
                 }
     return {
         "unlocked": False,
@@ -99,17 +101,21 @@ def vault_status(request: Request) -> dict[str, bool | int | str | None]:
         "account_count": 0,
         "accounts_locked": False,
         "shard_upload_concurrency": SHARD_UPLOAD_CONCURRENCY,
+        "preview_max_bytes": PREVIEW_MAX_BYTES,
     }
 
 
 @router.post("/lock")
 def vault_lock(request: Request) -> dict[str, bool]:
     """Alias for logout (clears the unlocked session)."""
+    user_id = request.session.get("user_id")
     request.session.pop("vault_unlocked", None)
     request.session.pop("user_id", None)
     request.session.pop("username", None)
     request.session.pop("master_key", None)
     auth_context.clear_auth()
+    if user_id:
+        activity_store.record(str(user_id), "lock", "success")
     return {"ok": True}
 
 
@@ -122,28 +128,103 @@ def list_files(
     return vault_service.list_entries(path)
 
 
+@router.get("/search")
+def search_files(
+    request: Request,
+    q: str = Query(default="", min_length=0),
+    scope: str = Query(default="folder", description="'folder' or 'global'"),
+    path: str = Query(default="/"),
+    kind: str = Query(default="all", description="'all', 'file', or 'dir'"),
+    regex: bool = Query(default=False),
+) -> dict[str, Any]:
+    """Search entry names under the vault (or current folder tree)."""
+    require_unlocked(request)
+    try:
+        results = vault_service.search_entries(
+            q,
+            scope=scope,
+            path=path,
+            kind=kind,
+            regex=regex,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {
+        "query": q.strip(),
+        "scope": scope,
+        "path": path,
+        "kind": kind,
+        "regex": regex,
+        "truncated": len(results) >= vault_service.SEARCH_RESULT_LIMIT,
+        "results": results,
+    }
+
+
 @router.post("/mkdir")
 def mkdir(request: Request, body: MkdirBody) -> dict:
     require_unlocked(request)
+    user_id = auth_context.require_user_id()
     try:
-        return vault_service.mkdir(body.parent, body.name)
+        entry = vault_service.mkdir(body.parent, body.name)
     except ValueError as exc:
+        activity_store.record(
+            user_id,
+            "mkdir",
+            "error",
+            path=body.name,
+            detail=str(exc),
+            meta={"parent": body.parent},
+        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    activity_store.record(
+        user_id,
+        "mkdir",
+        "success",
+        path=entry.get("path"),
+        meta={"parent": body.parent, "name": body.name},
+    )
+    return entry
 
 
 @router.post("/move")
 def move_entry(request: Request, body: MoveBody) -> dict:
     require_unlocked(request)
+    user_id = auth_context.require_user_id()
     try:
-        return vault_service.move_entry(
+        entry = vault_service.move_entry(
             src_path=body.src_path,
             dest_path=body.dest_path,
             kind=body.kind,
         )
     except FileNotFoundError as exc:
+        activity_store.record(
+            user_id,
+            "move",
+            "error",
+            path=body.src_path,
+            detail=str(exc),
+            meta={"dest_path": body.dest_path, "kind": body.kind},
+        )
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
+        activity_store.record(
+            user_id,
+            "move",
+            "error",
+            path=body.src_path,
+            detail=str(exc),
+            meta={"dest_path": body.dest_path, "kind": body.kind},
+        )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    activity_store.record(
+        user_id,
+        "move",
+        "success",
+        path=body.src_path,
+        detail=f"→ {body.dest_path}",
+        meta={"dest_path": body.dest_path, "kind": body.kind},
+    )
+    return entry
 
 
 @router.post("/dirs/delete")
@@ -163,7 +244,7 @@ def delete_dir(request: Request, body: DeleteDirBody) -> dict:
         raise HTTPException(status_code=404, detail="Folder not found")
 
     job_id = jobs.run_in_thread(
-        "delete",
+        "delete_dir",
         user_id=user_id,
         master_key=master_key,
         work=lambda on_progress: vault_service.delete_directory(body.path, on_progress),
@@ -221,6 +302,33 @@ def get_job(request: Request, job_id: str) -> dict:
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return job.to_public()
+
+
+_CANCELABLE_JOB_KINDS = frozenset(
+    {"health", "delete_file", "delete_dir", "evacuate"}
+)
+
+
+@router.post("/jobs/{job_id}/cancel")
+def cancel_job(request: Request, job_id: str) -> dict[str, bool]:
+    """Cancel a running health, delete, or evacuate job."""
+    require_unlocked(request)
+    user_id = auth_context.require_user_id()
+    job = jobs.get(job_id)
+    if job is None or job.user_id != user_id:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.kind not in _CANCELABLE_JOB_KINDS:
+        raise HTTPException(status_code=400, detail="Job cannot be cancelled")
+    if job.status != "running" and not job.cancel_requested:
+        return {"ok": True}
+    message = {
+        "health": "Health check cancelled",
+        "delete_file": "Delete cancelled",
+        "delete_dir": "Delete cancelled",
+        "evacuate": "Evacuate cancelled",
+    }.get(job.kind, "Cancelled")
+    jobs.request_cancel(job_id, message)
+    return {"ok": True}
 
 
 @router.get("/jobs/{job_id}/events")
@@ -533,6 +641,8 @@ async def start_download(request: Request, id: str = Query(...)) -> dict:
     size = entry.get("size")
     shard_count = len(entry.get("shards", []))
     job = jobs.create("download", user_id=user_id)
+    job.result_name = filename
+    job.result_meta = {"path": entry["path"], "filename": filename, "file_id": id, "kind": "file"}
     jobs.update(
         job.id,
         phase="queued",
@@ -566,7 +676,14 @@ async def start_zip_download(request: Request, body: ZipDownloadBody) -> dict:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    job = jobs.create("download", user_id=user_id)
+    job = jobs.create("download_zip", user_id=user_id)
+    job.result_name = zip_filename
+    job.result_meta = {
+        "path": zip_filename,
+        "filename": zip_filename,
+        "kind": "zip",
+        "file_count": len(members),
+    }
     jobs.update(
         job.id,
         phase="queued",
@@ -673,7 +790,17 @@ def download_stream(request: Request, job_id: str) -> StreamingResponse:
                     jobs.request_cancel(job_id, "Download cancelled")
                     log.info("download cancelled job_id=%s", job_id)
                     return
-                jobs.complete(job_id, result_name=session.filename)
+                jobs.complete(
+                    job_id,
+                    result_name=session.filename,
+                    result_meta={
+                        "path": session.filename,
+                        "filename": session.filename,
+                        "size": session.size,
+                        "file_id": session.file_id,
+                        "kind": session.kind,
+                    },
+                )
             except GeneratorExit:
                 session.cancel_requested.set()
                 jobs.request_cancel(job_id, "Client disconnected")
@@ -689,7 +816,16 @@ def download_stream(request: Request, job_id: str) -> StreamingResponse:
                     return
                 job = jobs.get(job_id)
                 if job is None or job.status == "running":
-                    jobs.fail(job_id, str(exc))
+                    jobs.fail(
+                        job_id,
+                        str(exc),
+                        result_meta={
+                            "path": session.filename,
+                            "filename": session.filename,
+                            "file_id": session.file_id,
+                            "kind": session.kind,
+                        },
+                    )
                 raise
             finally:
                 download_sessions.finish(job_id)
@@ -718,7 +854,7 @@ async def delete_file(request: Request, file_id: str) -> dict:
         raise HTTPException(status_code=404, detail="File not found")
 
     job_id = jobs.run_in_thread(
-        "delete",
+        "delete_file",
         user_id=user_id,
         master_key=master_key,
         work=lambda on_progress: vault_service.delete_file(file_id, on_progress),

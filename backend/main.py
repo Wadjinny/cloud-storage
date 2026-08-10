@@ -6,6 +6,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from config import SESSION_SECRET, cors_allow_origins
 from routes.accounts import router as accounts_router
+from routes.activity import router as activity_router
 from routes.auth import router as auth_router
 from routes.auth_google import router as auth_google_router
 from routes.auth_mega import router as auth_mega_router
@@ -39,6 +40,7 @@ app.add_middleware(
 
 app.include_router(auth_router)
 app.include_router(accounts_router)
+app.include_router(activity_router)
 app.include_router(auth_google_router)
 app.include_router(auth_mega_router)
 app.include_router(vault_router)

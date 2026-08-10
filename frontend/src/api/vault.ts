@@ -15,6 +15,8 @@ export type VaultStatus = {
   accounts_locked?: boolean
   /** Max parallel shard uploads; also the batch file-upload worker count. */
   shard_upload_concurrency?: number
+  /** Max file size (bytes) for in-browser image/PDF preview. */
+  preview_max_bytes?: number
 }
 
 export type ThumbStatus = 'none' | 'ready' | 'failed' | 'unsupported' | string
@@ -181,17 +183,21 @@ export async function moveVaultEntry(
 export async function deleteVaultDir(
   path: string,
   onProgress?: (update: ProgressUpdate) => void,
+  opts?: { signal?: AbortSignal },
 ): Promise<void> {
+  const signal = opts?.signal
   onProgress?.({ percent: 0, message: 'Starting folder delete…', phase: 'queued' })
   const res = await fetch(apiUrl('/api/vault/dirs/delete'), {
     method: 'POST',
     credentials: 'include',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ path }),
+    signal,
   })
   if (!res.ok) throw new Error(await readError(res))
   const { job_id: jobId } = (await res.json()) as { job_id: string }
-  await waitForJob(jobId, onProgress)
+  if (signal?.aborted) throw new Error('Delete cancelled')
+  await waitForCancelableJob(jobId, 'Delete cancelled', onProgress, signal)
 }
 
 export async function listVaultFiles(path: string): Promise<VaultEntry[]> {
@@ -199,6 +205,37 @@ export async function listVaultFiles(path: string): Promise<VaultEntry[]> {
   const res = await fetch(apiUrl(`/api/vault/files?${qs}`), { credentials: 'include' })
   if (!res.ok) throw new Error(await readError(res))
   return res.json() as Promise<VaultEntry[]>
+}
+
+export type VaultSearchScope = 'folder' | 'global'
+export type VaultSearchKind = 'all' | 'file' | 'dir'
+
+export type VaultSearchResponse = {
+  query: string
+  scope: VaultSearchScope | string
+  path: string
+  kind: VaultSearchKind | string
+  regex: boolean
+  truncated: boolean
+  results: VaultEntry[]
+}
+
+export async function searchVaultFiles(opts: {
+  q: string
+  scope?: VaultSearchScope
+  path?: string
+  kind?: VaultSearchKind
+  regex?: boolean
+}): Promise<VaultSearchResponse> {
+  const qs = new URLSearchParams()
+  qs.set('q', opts.q)
+  if (opts.scope) qs.set('scope', opts.scope)
+  if (opts.path) qs.set('path', opts.path)
+  if (opts.kind) qs.set('kind', opts.kind)
+  if (opts.regex) qs.set('regex', 'true')
+  const res = await fetch(apiUrl(`/api/vault/search?${qs}`), { credentials: 'include' })
+  if (!res.ok) throw new Error(await readError(res))
+  return res.json() as Promise<VaultSearchResponse>
 }
 
 export async function getVaultFile(id: string): Promise<VaultFileDetail> {
@@ -294,6 +331,43 @@ export async function cancelDownloadJob(jobId: string): Promise<void> {
   }
 }
 
+export async function cancelJob(jobId: string): Promise<void> {
+  try {
+    await fetch(apiUrl(`/api/vault/jobs/${encodeURIComponent(jobId)}/cancel`), {
+      method: 'POST',
+      credentials: 'include',
+    })
+  } catch {
+    /* ignore */
+  }
+}
+
+async function waitForCancelableJob(
+  jobId: string,
+  cancelledMessage: string,
+  onProgress?: (update: ProgressUpdate) => void,
+  signal?: AbortSignal,
+): Promise<TransferJob> {
+  const onAbort = () => {
+    void cancelJob(jobId)
+  }
+  signal?.addEventListener('abort', onAbort)
+  try {
+    return await waitForJob(jobId, onProgress, signal)
+  } catch (err) {
+    if (
+      signal?.aborted ||
+      (err instanceof TransferJobError && err.job.cancel_requested)
+    ) {
+      await cancelJob(jobId)
+      throw new Error(cancelledMessage)
+    }
+    throw err
+  } finally {
+    signal?.removeEventListener('abort', onAbort)
+  }
+}
+
 async function putUploadBody(
   jobId: string,
   body: Blob,
@@ -308,6 +382,14 @@ async function putUploadBody(
   })
 }
 
+/**
+ * Max parallel file uploads from the browser.
+ * Each file holds an SSE progress stream + a PUT body; Chromium-like browsers
+ * allow only ~6 HTTP/1.1 connections per host, so 6×SSE alone starves PUTs
+ * and the batch hangs at 0% with no error.
+ */
+export const MAX_PARALLEL_UPLOAD_FILES = 3
+
 async function runUploadAttempt(
   jobId: string,
   body: Blob,
@@ -318,9 +400,12 @@ async function runUploadAttempt(
     void cancelUploadJob(jobId)
   }
   signal?.addEventListener('abort', onAbort)
+  // Start PUT before SSE so body upload wins the browser connection pool when
+  // several files run in parallel (SSE-first filled all 6 slots and deadlocked).
+  const putPromise = putUploadBody(jobId, body, signal)
   const events = waitForJob(jobId, onProgress, signal)
   try {
-    const putRes = await putUploadBody(jobId, body, signal)
+    const putRes = await putPromise
     if (!putRes.ok) {
       let jobErr: unknown
       try {
@@ -508,6 +593,54 @@ export async function downloadVaultFile(
   })
 }
 
+/** Decrypt a vault file into a Blob (in-memory; for preview). */
+export async function fetchVaultFileBlob(
+  id: string,
+  opts?: { signal?: AbortSignal; mime?: string },
+): Promise<{ blob: Blob; filename: string }> {
+  const signal = opts?.signal
+  if (signal?.aborted) throw new Error('Download cancelled')
+
+  const qs = new URLSearchParams({ id })
+  const res = await fetch(apiUrl(`/api/vault/download?${qs}`), {
+    method: 'POST',
+    credentials: 'include',
+    signal,
+  })
+  if (!res.ok) throw new Error(await readError(res))
+  const started = (await res.json()) as {
+    job_id: string
+    filename?: string
+  }
+  const jobId = started.job_id
+  const filename = started.filename || id
+  const streamUrl = apiUrl(`/api/vault/download/${encodeURIComponent(jobId)}/stream`)
+  const onAbort = () => {
+    void cancelDownloadJob(jobId)
+  }
+  signal?.addEventListener('abort', onAbort)
+  const events = waitForJob(jobId, undefined, signal)
+  try {
+    const streamRes = await fetch(streamUrl, { credentials: 'include', signal })
+    if (!streamRes.ok) throw new Error(await readError(streamRes))
+    const raw = await streamRes.blob()
+    const blob =
+      opts?.mime && raw.type !== opts.mime
+        ? new Blob([raw], { type: opts.mime })
+        : raw
+    await events
+    return { blob, filename }
+  } catch (err) {
+    if (signal?.aborted || (err instanceof Error && err.message === 'Download cancelled')) {
+      await cancelDownloadJob(jobId)
+      throw new Error('Download cancelled')
+    }
+    throw err
+  } finally {
+    signal?.removeEventListener('abort', onAbort)
+  }
+}
+
 export type ZipDownloadItem = {
   kind: 'file' | 'dir'
   path: string
@@ -551,13 +684,17 @@ export async function downloadVaultZip(
 export async function deleteVaultFile(
   id: string,
   onProgress?: (update: ProgressUpdate) => void,
+  opts?: { signal?: AbortSignal },
 ): Promise<void> {
+  const signal = opts?.signal
   onProgress?.({ percent: 0, message: 'Starting delete…', phase: 'queued' })
   const res = await fetch(apiUrl(`/api/vault/files/${encodeURIComponent(id)}`), {
     method: 'DELETE',
     credentials: 'include',
+    signal,
   })
   if (!res.ok) throw new Error(await readError(res))
   const { job_id: jobId } = (await res.json()) as { job_id: string }
-  await waitForJob(jobId, onProgress)
+  if (signal?.aborted) throw new Error('Delete cancelled')
+  await waitForCancelableJob(jobId, 'Delete cancelled', onProgress, signal)
 }

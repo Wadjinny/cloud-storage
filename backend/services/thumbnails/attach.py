@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from typing import Any
 
 from services import crypto
+from storage import auth_context
 from services.thumbnails.classify import classify_filename
 from services.thumbnails.generate import ThumbGenError, generate_webp
 from services.thumbnails.store import (
@@ -76,3 +78,42 @@ def attach_after_upload(
             persist_status(file_id, "failed", error=str(exc) or type(exc).__name__)
         except Exception:
             log.exception("thumb status persist failed file=%s", file_id)
+
+
+def schedule_after_upload(
+    *,
+    user_id: str,
+    master_key: bytes,
+    file_id: str,
+    filename: str,
+    spool_path: Path | None,
+    remote_folders: dict[str, str],
+    accounts: list[dict[str, Any]] | None = None,
+) -> None:
+    """Run ``attach_after_upload`` on a daemon thread; never blocks the caller.
+
+    The worker re-establishes the user's auth scope (thread pools do not inherit
+    contextvars) and owns spool cleanup so the upload path can return immediately.
+    """
+
+    def _run() -> None:
+        try:
+            with auth_context.auth_scope(user_id, master_key):
+                attach_after_upload(
+                    file_id=file_id,
+                    filename=filename,
+                    spool_path=spool_path,
+                    master_key=master_key,
+                    remote_folders=remote_folders,
+                    accounts=accounts,
+                )
+        except Exception:
+            log.exception("thumb schedule failed file=%s", file_id)
+        finally:
+            if spool_path is not None:
+                try:
+                    spool_path.unlink(missing_ok=True)
+                except Exception:
+                    log.exception("spool cleanup failed file=%s", file_id)
+
+    threading.Thread(target=_run, name=f"thumb-{file_id}", daemon=True).start()

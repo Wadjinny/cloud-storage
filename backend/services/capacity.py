@@ -48,6 +48,19 @@ def cipher_size(plaintext_len: int) -> int:
     return max(0, plaintext_len) + GCM_TAG_LEN
 
 
+def estimate_shard_cipher_bytes(file_size: int, chunk_size: int, shard_i: int) -> int:
+    """Cipher size for shard ``i`` from plaintext file size (GCM tag included)."""
+    size = max(0, int(file_size))
+    chunk = max(1, int(chunk_size))
+    index = max(0, int(shard_i))
+    if size == 0:
+        return cipher_size(0) if index == 0 else 0
+    offset = index * chunk
+    if offset >= size:
+        return 0
+    return cipher_size(min(chunk, size - offset))
+
+
 def usage_ratio(used: int, total: int) -> float:
     if total <= 0:
         return 1.0

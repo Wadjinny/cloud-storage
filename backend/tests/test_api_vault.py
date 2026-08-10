@@ -193,3 +193,5 @@ def test_accounts_list_and_storage(unlocked_client: TestClient) -> None:
     body = storage.json()
     assert body["combined"]["account_count"] == 1
     assert body["accounts"][0]["total"] is not None
+    assert "vault_used" in body["accounts"][0]
+    assert body["combined"]["vault_used"] == body["accounts"][0]["vault_used"]

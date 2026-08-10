@@ -1,14 +1,51 @@
 from __future__ import annotations
 
+import logging
 import queue
 import secrets
 import threading
 import time
 from collections.abc import Callable
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 
 ProgressCb = Callable[[str, int, int, str], None]
+
+log = logging.getLogger(__name__)
+
+# Set while a run_in_thread worker executes so services can poll cancel.
+_job_should_abort: ContextVar[Callable[[], bool] | None] = ContextVar(
+    "job_should_abort", default=None
+)
+
+
+class JobCancelled(Exception):
+    """Raised by job workers when the user cancels a running job."""
+
+
+def should_abort() -> bool:
+    fn = _job_should_abort.get()
+    return bool(fn and fn())
+
+
+def raise_if_cancelled(message: str = "Cancelled") -> None:
+    if should_abort():
+        raise JobCancelled(message)
+
+# Map Job.kind → activity action (unknown kinds pass through unchanged).
+_JOB_ACTION_MAP: dict[str, str] = {
+    "upload": "upload",
+    "download": "download",
+    "download_zip": "download_zip",
+    "delete": "delete_file",
+    "delete_file": "delete_file",
+    "delete_dir": "delete_dir",
+    "health": "health",
+    "prune": "prune",
+    "prune_analyze": "prune_analyze",
+    "evacuate": "account_evacuate",
+}
 
 
 @dataclass
@@ -89,15 +126,30 @@ class JobStore:
 
         def _runner() -> None:
             def on_progress(phase: str, current: int, total: int, message: str) -> None:
+                if self.is_cancel_requested(job.id):
+                    raise JobCancelled(job.error or "Cancelled")
                 self.update(
                     job.id, phase=phase, current=current, total=total, message=message
                 )
 
-            with auth_context.auth_scope(user_id, master_key):
-                try:
-                    self.complete(job.id, result_meta=work(on_progress))
-                except Exception as exc:
-                    self.fail(job.id, str(exc))
+            abort_token = _job_should_abort.set(
+                lambda: self.is_cancel_requested(job.id)
+            )
+            try:
+                with auth_context.auth_scope(user_id, master_key):
+                    try:
+                        result = work(on_progress)
+                        if self.is_cancel_requested(job.id):
+                            return
+                        self.complete(job.id, result_meta=result)
+                    except JobCancelled as exc:
+                        msg = str(exc) or "Cancelled"
+                        if not self.is_cancel_requested(job.id):
+                            self.request_cancel(job.id, msg)
+                    except Exception as exc:
+                        self.fail(job.id, str(exc))
+            finally:
+                _job_should_abort.reset(abort_token)
 
         threading.Thread(target=_runner, daemon=True).start()
         return job.id
@@ -145,6 +197,7 @@ class JobStore:
         result_meta: dict[str, Any] | None = None,
         result_name: str | None = None,
     ) -> None:
+        snapshot: Job | None = None
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
@@ -157,7 +210,9 @@ class JobStore:
             job.current = job.total or job.current
             job.result_meta = result_meta
             job.result_name = result_name
+            snapshot = job
         self._notify(job_id)
+        self._record_activity(snapshot, "success")
 
     def fail(
         self,
@@ -166,6 +221,7 @@ class JobStore:
         *,
         result_meta: dict[str, Any] | None = None,
     ) -> None:
+        snapshot: Job | None = None
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
@@ -178,10 +234,13 @@ class JobStore:
             job.error = error
             if result_meta is not None:
                 job.result_meta = result_meta
+            snapshot = job
         self._notify(job_id)
+        self._record_activity(snapshot, "error")
 
     def request_cancel(self, job_id: str, message: str = "Cancelled") -> bool:
         """Mark job cancelled and fail it if still running. Returns False if missing."""
+        snapshot: Job | None = None
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
@@ -192,8 +251,43 @@ class JobStore:
                 job.phase = "error"
                 job.message = message
                 job.error = message
+                snapshot = job
         self._notify(job_id)
+        if snapshot is not None:
+            self._record_activity(snapshot, "cancelled")
         return True
+
+    def _record_activity(self, job: Job, status: str) -> None:
+        if not job.user_id:
+            return
+        try:
+            from storage import activity as activity_store
+
+            meta = dict(job.result_meta) if isinstance(job.result_meta, dict) else {}
+            meta["job_id"] = job.id
+            meta["job_kind"] = job.kind
+            path = None
+            if isinstance(job.result_meta, dict):
+                raw_path = job.result_meta.get("path")
+                if isinstance(raw_path, str) and raw_path:
+                    path = raw_path
+            if path is None and job.result_name:
+                path = job.result_name
+            detail = None
+            if status == "success":
+                detail = job.message if job.message and job.message != "Done" else None
+            else:
+                detail = job.error or job.message
+            activity_store.record(
+                job.user_id,
+                _JOB_ACTION_MAP.get(job.kind, job.kind),
+                status,
+                path=path,
+                detail=detail,
+                meta=meta,
+            )
+        except Exception:
+            log.exception("activity record failed job_id=%s", job.id)
 
     def is_cancel_requested(self, job_id: str) -> bool:
         with self._lock:

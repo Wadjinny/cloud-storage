@@ -230,6 +230,32 @@ def test_analyze_all_reports_orphans_without_deleting(
         assert "f_kept" in children
 
 
+def test_prune_orphan_includes_vault_path(
+    data_dir: Path,
+    memory_account: dict,
+) -> None:
+    MemoryProvider.reset()
+    account_id = memory_account["id"]
+    provider = MemoryProvider({})
+
+    with _scope():
+        from storage import folders as folders_store
+
+        folder = folders_store.ensure_folder("/docs")
+        provider.ensure_child_folder(folder["id"])
+        provider.ensure_file_folder("f_gone")
+
+        report = prune_service.analyze_all()
+        by_name = {
+            o["name"]: o
+            for acc in report["accounts"]
+            if acc["account_id"] == account_id
+            for o in acc["orphans"]
+        }
+        assert by_name[folder["id"]]["path"] == "/docs"
+        assert "path" not in by_name["f_gone"]
+
+
 def test_prune_api_analyze_then_apply(
     unlocked_client: TestClient,
     memory_account: dict,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -9,12 +10,16 @@ from services import vault as vault_service
 from services.upload_pipeline import upload_pipelines
 from storage import accounts as accounts_store
 from storage import auth_context
+from storage import folders as folders_store
 from storage import upload_sessions
 from storage import vault_index
 
 log = logging.getLogger(__name__)
 
 ProgressCb = Callable[[str, int, int, str], None]
+
+_SHARD_NAME_RE = re.compile(r"^shard_(f_[0-9a-f]+)_\d+", re.IGNORECASE)
+_THUMB_NAME_RE = re.compile(r"^thumb_(f_[0-9a-f]+)\.webp\.enc$", re.IGNORECASE)
 
 
 def _emit(
@@ -27,6 +32,30 @@ def _emit(
     if cb is None:
         return
     cb(phase, current, total, message)
+
+
+def _vault_path_for_remote_name(
+    name: str,
+    *,
+    folder_paths: dict[str, str],
+    file_paths: dict[str, str],
+) -> str | None:
+    """Map an opaque remote display name to a vault filesystem path when known."""
+    if not name:
+        return None
+    if name in folder_paths:
+        return folder_paths[name]
+    if name in file_paths:
+        return file_paths[name]
+    thumb = _THUMB_NAME_RE.match(name)
+    if thumb:
+        path = file_paths.get(thumb.group(1))
+        return f"{path} (thumbnail)" if path else None
+    shard = _SHARD_NAME_RE.match(name)
+    if shard:
+        path = file_paths.get(shard.group(1))
+        return path
+    return None
 
 
 def _analyze_account(
@@ -49,6 +78,8 @@ def _analyze_account(
         keep_names = set(keep["names"])
         keep_folder_ids = set(keep["folder_ids"])
         keep_shard_ids = set(keep["shard_remote_ids"])
+        folder_paths = folders_store.id_path_map()
+        file_paths = vault_index.id_path_map()
 
         # Only in-flight uploads are protected. Abandoned "active" resume sessions
         # (process crash, closed tab, failed job never marked failed) are stale.
@@ -90,13 +121,17 @@ def _analyze_account(
             if kind == "file" and child_id in keep_shard_ids:
                 kept += 1
                 continue
-            orphans.append(
-                {
-                    "id": child_id,
-                    "name": name or child_id,
-                    "kind": kind,
-                }
+            path = _vault_path_for_remote_name(
+                name, folder_paths=folder_paths, file_paths=file_paths
             )
+            orphan: dict[str, str] = {
+                "id": child_id,
+                "name": name or child_id,
+                "kind": kind,
+            }
+            if path:
+                orphan["path"] = path
+            orphans.append(orphan)
         base["orphans"] = orphans
         base["kept"] = kept
     except Exception as exc:

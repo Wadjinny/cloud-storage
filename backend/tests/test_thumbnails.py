@@ -122,8 +122,15 @@ def test_upload_image_gets_thumbnail(
     assert body["status"] == "done", body
     file_id = body["result"]["id"]
 
-    listing = unlocked_client.get("/api/vault/files?path=/").json()
-    row = next(e for e in listing if e["id"] == file_id)
+    # Thumbnail generation runs off the upload critical path, so it may land
+    # shortly after the job reports done; poll until it is ready.
+    row: dict = {}
+    for _ in range(80):
+        listing = unlocked_client.get("/api/vault/files?path=/").json()
+        row = next(e for e in listing if e["id"] == file_id)
+        if row["thumb_status"] == "ready":
+            break
+        time.sleep(0.05)
     assert row["thumb_status"] == "ready"
 
     thumb = unlocked_client.get(f"/api/vault/files/{file_id}/thumbnail")

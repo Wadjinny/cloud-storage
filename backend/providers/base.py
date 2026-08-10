@@ -2,8 +2,12 @@ from typing import Protocol
 
 
 class StorageProvider(Protocol):
-    def ensure_file_folder(self, file_id: str) -> str:
-        """Create (or reuse) a per-vault-file folder under the shard root; return its id."""
+    def ensure_child_folder(self, name: str, *, parent_id: str | None = None) -> str:
+        """Create (or reuse) folder ``name`` under ``parent_id``, or vault root if None."""
+        ...
+
+    def ensure_file_folder(self, file_id: str, *, parent_id: str | None = None) -> str:
+        """Create (or reuse) a per-vault-file folder under ``parent_id`` or vault root."""
         ...
 
     def list_vault_children(self) -> list[dict[str, str]]:

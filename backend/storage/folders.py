@@ -5,7 +5,7 @@ import time
 from typing import Any
 
 from storage import auth_context
-from storage.db import connect
+from storage.db import connect, escape_like
 
 
 def normalize_dir(path: str) -> str:
@@ -108,6 +108,32 @@ def get_folder(path: str, *, user_id: str | None = None) -> dict[str, Any] | Non
         return _get_folder_row(conn, uid, norm)
 
 
+def path_by_id(folder_id: str, *, user_id: str | None = None) -> str | None:
+    """Vault path for a folder row id, or None if unknown."""
+    if not folder_id or folder_id == "dir:/":
+        return "/"
+    uid = user_id or auth_context.require_user_id()
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT path FROM folders WHERE user_id = ? AND id = ?",
+            (uid, folder_id),
+        ).fetchone()
+    if row is None:
+        return None
+    return str(row["path"])
+
+
+def id_path_map(*, user_id: str | None = None) -> dict[str, str]:
+    """All folder id → path mappings for the user."""
+    uid = user_id or auth_context.require_user_id()
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, path FROM folders WHERE user_id = ?",
+            (uid,),
+        ).fetchall()
+    return {str(row["id"]): str(row["path"]) for row in rows}
+
+
 def list_child_names(base: str, *, user_id: str | None = None) -> list[dict[str, Any]]:
     """Folders whose path is exactly one level under ``base``."""
     uid = user_id or auth_context.require_user_id()
@@ -152,6 +178,85 @@ def ensure_folder(path: str, *, user_id: str | None = None) -> dict[str, Any]:
         return _ensure_folder_conn(conn, uid, path)
 
 
+def folder_id_chain(path: str, *, user_id: str | None = None) -> list[str]:
+    """Vault folder ids from root-most to leaf for ``path`` (empty for ``/``)."""
+    uid = user_id or auth_context.require_user_id()
+    norm = normalize_dir(path)
+    if norm == "/":
+        return []
+    parts = [p for p in norm.strip("/").split("/") if p]
+    chain: list[str] = []
+    current = ""
+    with connect() as conn:
+        for part in parts:
+            current = f"{current}/{part}"
+            row = _get_folder_row(conn, uid, current)
+            if row is None:
+                row = _ensure_folder_conn(conn, uid, current)
+            chain.append(str(row["id"]))
+    return chain
+
+
+def list_folder_ids_under(path: str, *, user_id: str | None = None) -> list[str]:
+    """Folder ids for ``path`` and all descendants."""
+    uid = user_id or auth_context.require_user_id()
+    norm = normalize_dir(path)
+    if norm == "/":
+        raise ValueError("Cannot list under root as a deletable folder tree")
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id FROM folders
+            WHERE user_id = ? AND (path = ? OR path LIKE ? ESCAPE '\\')
+            """,
+            (uid, norm, escape_like(norm) + "/%"),
+        ).fetchall()
+    return [str(r["id"]) for r in rows]
+
+
+def list_folders_under(base: str = "/", *, user_id: str | None = None) -> list[dict[str, Any]]:
+    """All registered folders under ``base`` (recursive). ``base=/`` → entire tree."""
+    uid = user_id or auth_context.require_user_id()
+    base_norm = normalize_dir(base)
+    with connect() as conn:
+        if base_norm == "/":
+            rows = conn.execute(
+                """
+                SELECT id, path, mtime, created_at, updated_at
+                FROM folders WHERE user_id = ? ORDER BY path
+                """,
+                (uid,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id, path, mtime, created_at, updated_at
+                FROM folders
+                WHERE user_id = ?
+                  AND (path = ? OR path LIKE ? ESCAPE '\\')
+                ORDER BY path
+                """,
+                (uid, base_norm, escape_like(base_norm) + "/%"),
+            ).fetchall()
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        path = str(row["path"])
+        name = path.rsplit("/", 1)[-1] if path != "/" else ""
+        if not name:
+            continue
+        out.append(
+            {
+                "id": row["id"],
+                "name": name,
+                "path": path,
+                "mtime": row["mtime"],
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+        )
+    return out
+
+
 def mkdir(parent: str, name: str, *, user_id: str | None = None) -> dict[str, Any]:
     uid = user_id or auth_context.require_user_id()
     parent_norm = normalize_dir(parent)
@@ -189,10 +294,10 @@ def rename_folder_tree(
         rows = conn.execute(
             """
             SELECT id, path FROM folders
-            WHERE user_id = ? AND (path = ? OR path LIKE ?)
+            WHERE user_id = ? AND (path = ? OR path LIKE ? ESCAPE '\\')
             ORDER BY length(path) DESC
             """,
-            (uid, old_norm, old_norm + "/%"),
+            (uid, old_norm, escape_like(old_norm) + "/%"),
         ).fetchall()
         updated = 0
         for row in rows:
@@ -233,8 +338,8 @@ def delete_folder_tree(path: str, *, user_id: str | None = None) -> int:
         cur = conn.execute(
             """
             DELETE FROM folders
-            WHERE user_id = ? AND (path = ? OR path LIKE ?)
+            WHERE user_id = ? AND (path = ? OR path LIKE ? ESCAPE '\\')
             """,
-            (uid, norm, norm + "/%"),
+            (uid, norm, escape_like(norm) + "/%"),
         )
         return cur.rowcount

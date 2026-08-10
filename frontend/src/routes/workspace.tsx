@@ -1,19 +1,30 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useEffect, useMemo, useRef, useState, type DragEvent, type MouseEvent } from 'react'
-import { useSearchParams } from 'react-router'
+import {
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type DragEvent,
+  type MouseEvent,
+} from 'react'
+import { Link, useSearchParams } from 'react-router'
 import { Group, Panel, Separator, usePanelRef } from 'react-resizable-panels'
 import { login, logout } from '../api/auth'
 import {
+  AccountInUseError,
   analyzePrune,
   applyPrune,
   connectMega,
   deleteAccount,
+  evacuateAccount,
   getStorageStats,
   listAccounts,
   runHealthCheck,
   setAccountEnabled,
   startGoogleOAuth,
   type Account,
+  type AccountInUseDetail,
   type AccountStorage,
   type HealthCheckResult,
   type PruneAnalyzeResult,
@@ -26,13 +37,16 @@ import {
   getVaultFile,
   getVaultStatus,
   listVaultFiles,
+  MAX_PARALLEL_UPLOAD_FILES,
   mkdirVault,
   moveVaultEntry,
+  searchVaultFiles,
   uploadVaultFile,
   type ProgressUpdate,
-  type UploadAccountStats,
   type UploadJobStats,
   type VaultEntry,
+  type VaultSearchKind,
+  type VaultSearchScope,
   type VaultStatus,
 } from '../api/vault'
 import {
@@ -46,17 +60,35 @@ import {
   type UploadItem,
 } from '../collectUploadItems'
 import {
+  buildUploadPlan,
+  detectUploadConflicts,
+  type ConflictAction,
+  type ConflictScan,
+} from '../uploadConflicts'
+import {
   ensureDownloadFolder,
   getDownloadFolderName,
   supportsDownloadFolder,
 } from '../downloadFolder'
+import { FilePreviewDialog } from '../FilePreviewDialog'
 import { FileThumb } from '../FileThumb'
-import { TransferBatchPanel } from '../TransferBatchPanel'
+import {
+  DEFAULT_PREVIEW_MAX_BYTES,
+  previewableImagesInFolder,
+  previewOpenKind,
+  type PreviewOpenKind,
+} from '../filePreview'
+import {
+  ShardBoxesBar,
+  useTransfer,
+  type AccountRate,
+  type TransferKind,
+  type TransferState,
+} from '../TransferContext'
 import {
   buildTransferTree,
   initialFileStatuses,
   type TransferFileStatus,
-  type TransferTreeNode,
 } from '../transferTree'
 
 const SKIP_UPLOAD_NAMES = new Set(['.DS_Store', 'Thumbs.db', 'desktop.ini'])
@@ -67,44 +99,6 @@ const RATE_WINDOW_MS = 60_000
 const ERROR_AUTO_HIDE_MS = 60_000
 
 type RateSample = { t: number; shards: number; bytes: number }
-
-type AccountRate = { shardsPerSec: number; mbPerSec: number }
-
-type TransferKind = 'upload' | 'download' | 'delete' | 'prune' | 'health'
-
-const TRANSFER_LABELS: Record<TransferKind, string> = {
-  upload: 'Upload',
-  download: 'Download',
-  delete: 'Delete',
-  prune: 'Prune',
-  health: 'Health',
-}
-
-type TransferState = {
-  kind: TransferKind
-  percent: number
-  message: string
-  doneBytes?: number | null
-  totalBytes?: number | null
-  doneShards?: number
-  expectedShards?: number | null
-  activeShards?: number
-  shardsPerSec?: number | null
-  mbPerSec?: number | null
-  byAccount?: UploadAccountStats[]
-  accountRates?: Record<string, AccountRate>
-  /** Current file label (name or relative path). */
-  itemLabel?: string | null
-  itemIndex?: number
-  itemTotal?: number
-}
-
-type BatchQueueState = {
-  kind: 'upload' | 'download'
-  tree: TransferTreeNode[]
-  statuses: Record<string, TransferFileStatus>
-  visible: boolean
-}
 
 function formatBytes(n: number | null | undefined): string {
   if (n == null) return '—'
@@ -303,73 +297,27 @@ async function mapPool<T>(
 }
 
 
-function ShardBoxesBar({
-  done,
-  active = 0,
-  total,
-  variant = 'transfer',
-}: {
-  done: number
-  /** Boxes after `done` that are in-flight on this provider. */
-  active?: number
-  total: number
-  variant?: 'transfer' | 'account'
-}) {
-  const filled = Math.max(0, Math.floor(done))
-  const inFlight = Math.max(0, Math.floor(active))
-  const n = Math.max(1, Math.floor(total), filled + inFlight)
-  const prevFilledRef = useRef(filled)
-  const [pulseFrom, setPulseFrom] = useState<number | null>(null)
-
-  useEffect(() => {
-    const prev = prevFilledRef.current
-    prevFilledRef.current = filled
-    if (filled <= prev) {
-      setPulseFrom(null)
-      return
-    }
-    setPulseFrom(prev)
-    const t = window.setTimeout(() => setPulseFrom(null), 700)
-    return () => window.clearTimeout(t)
-  }, [filled])
-
-  return (
-    <div
-      className={`shard-boxes shard-boxes-${variant}`}
-      role="progressbar"
-      aria-valuenow={filled}
-      aria-valuemin={0}
-      aria-valuemax={n}
-      title={`${filled} done · ${inFlight} active / ${n} shards`}
-    >
-      {Array.from({ length: n }, (_, i) => {
-        const isDone = i < filled
-        const isActive = !isDone && i < filled + inFlight
-        const isPulse = isDone && pulseFrom != null && i >= pulseFrom
-        return (
-          <span
-            key={i}
-            className={[
-              'shard-box',
-              isDone ? 'shard-box-done' : '',
-              isActive ? 'shard-box-active' : '',
-              isPulse ? 'shard-box-pulse' : '',
-            ]
-              .filter(Boolean)
-              .join(' ')}
-          />
-        )
-      })}
-    </div>
-  )
-}
-
 export default function Workspace() {
   const qc = useQueryClient()
+  const {
+    transfer,
+    setTransfer,
+    setBatchQueue,
+    uploadAbortRef,
+    downloadAbortRef,
+    jobAbortRef,
+  } = useTransfer()
   const [searchParams, setSearchParams] = useSearchParams()
   const [path, setPath] = useState('/')
   const [selectedIds, setSelectedIds] = useState<string[]>([])
   const [anchorId, setAnchorId] = useState<string | null>(null)
+  const [searchInput, setSearchInput] = useState('')
+  const [searchScope, setSearchScope] = useState<VaultSearchScope>('folder')
+  const [searchKind, setSearchKind] = useState<VaultSearchKind>('all')
+  const [searchRegex, setSearchRegex] = useState(false)
+  const deferredSearch = useDeferredValue(searchInput.trim())
+  const searchActive = deferredSearch.length > 0
+  const pendingSelectRef = useRef<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [megaOpen, setMegaOpen] = useState(false)
   const [megaEmail, setMegaEmail] = useState('')
@@ -381,6 +329,18 @@ export default function Workspace() {
   const [mkdirName, setMkdirName] = useState('')
   const [renameOpen, setRenameOpen] = useState(false)
   const [renameValue, setRenameValue] = useState('')
+  const [uploadConflict, setUploadConflict] = useState<{
+    destDir: string
+    files: UploadItem[]
+    emptyDirs: string[]
+    scan: ConflictScan
+    actions: Record<string, ConflictAction>
+  } | null>(null)
+  const [uploadConflictBusy, setUploadConflictBusy] = useState(false)
+  const [filePreview, setFilePreview] = useState<{
+    entry: VaultEntry
+    kind: PreviewOpenKind
+  } | null>(null)
   const [dropTarget, setDropTarget] = useState<string | null>(null)
   const [pruneOpen, setPruneOpen] = useState(false)
   const [pruneReport, setPruneReport] = useState<PruneAnalyzeResult | null>(null)
@@ -388,13 +348,11 @@ export default function Workspace() {
   const [healthOpen, setHealthOpen] = useState(false)
   const [healthReport, setHealthReport] = useState<HealthCheckResult | null>(null)
   const [healthRunning, setHealthRunning] = useState(false)
+  const [evacuateOpen, setEvacuateOpen] = useState(false)
+  const [evacuateDetail, setEvacuateDetail] = useState<AccountInUseDetail | null>(null)
   const [accountsManage, setAccountsManage] = useState(false)
-  const [transfer, setTransfer] = useState<TransferState | null>(null)
-  const [batchQueue, setBatchQueue] = useState<BatchQueueState | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const folderInputRef = useRef<HTMLInputElement>(null)
-  const uploadAbortRef = useRef<AbortController | null>(null)
-  const downloadAbortRef = useRef<AbortController | null>(null)
   const transferRateSamplesRef = useRef<RateSample[]>([])
   const transferAccountRateSamplesRef = useRef<Map<string, RateSample[]>>(new Map())
   const uploadFilePercentsRef = useRef<Map<number, number>>(new Map())
@@ -553,7 +511,22 @@ export default function Workspace() {
     enabled: unlocked,
   })
 
-  const entries = filesQuery.data
+  const searchQuery = useQuery({
+    queryKey: ['vault', 'search', deferredSearch, searchScope, path, searchKind, searchRegex],
+    queryFn: () =>
+      searchVaultFiles({
+        q: deferredSearch,
+        scope: searchScope,
+        path,
+        kind: searchKind,
+        regex: searchRegex,
+      }),
+    enabled: unlocked && searchActive,
+    // Don't spin on 404/400 (e.g. stale backend without /search, or bad regex).
+    retry: false,
+  })
+
+  const entries = searchActive ? searchQuery.data?.results : filesQuery.data
   const selectedEntries = useMemo(() => {
     if (!entries) return []
     const byId = new Map(entries.map((e) => [e.id, e]))
@@ -592,6 +565,16 @@ export default function Workspace() {
     setSelectedIds([])
     setAnchorId(null)
   }, [path])
+
+  useEffect(() => {
+    const id = pendingSelectRef.current
+    if (!id || searchActive) return
+    const list = filesQuery.data
+    if (!list?.some((e) => e.id === id)) return
+    setSelectedIds([id])
+    setAnchorId(id)
+    pendingSelectRef.current = null
+  }, [filesQuery.data, searchActive, path])
 
   const crumbs = useMemo(() => pathParts(path), [path])
 
@@ -636,10 +619,50 @@ export default function Workspace() {
     mutationFn: deleteAccount,
     onSuccess: async () => {
       setError(null)
+      setEvacuateOpen(false)
+      setEvacuateDetail(null)
       await qc.invalidateQueries({ queryKey: ['accounts'] })
       await qc.invalidateQueries({ queryKey: ['vault', 'status'] })
     },
-    onError: (e: Error) => setError(e.message),
+    onError: (e: Error) => {
+      if (e instanceof AccountInUseError) {
+        setError(null)
+        setEvacuateDetail(e.detail)
+        setEvacuateOpen(true)
+        return
+      }
+      setError(e.message)
+    },
+  })
+
+  const evacuateMut = useMutation({
+    mutationFn: async (accountId: string) => {
+      const ac = new AbortController()
+      jobAbortRef.current = ac
+      try {
+        return await withTransfer('evacuate', 'Moving account data…', (onProgress) =>
+          evacuateAccount(accountId, onProgress, { signal: ac.signal }),
+        )
+      } finally {
+        jobAbortRef.current = null
+      }
+    },
+    onSuccess: async () => {
+      setError(null)
+      setEvacuateOpen(false)
+      setEvacuateDetail(null)
+      await qc.invalidateQueries({ queryKey: ['accounts'] })
+      await qc.invalidateQueries({ queryKey: ['accounts', 'storage'] })
+      await qc.invalidateQueries({ queryKey: ['vault'] })
+      await qc.invalidateQueries({ queryKey: ['vault', 'status'] })
+    },
+    onError: (e: Error) => {
+      if (e.message === 'Evacuate cancelled') {
+        setError(null)
+        return
+      }
+      setError(e.message)
+    },
   })
 
   const setAccountEnabledMut = useMutation({
@@ -694,9 +717,14 @@ export default function Workspace() {
       setHealthOpen(true)
       setHealthReport(null)
       setHealthRunning(true)
+      const ac = new AbortController()
+      jobAbortRef.current = ac
       try {
-        return await withTransfer('health', 'Checking shards…', runHealthCheck)
+        return await withTransfer('health', 'Checking shards…', (onProgress) =>
+          runHealthCheck(onProgress, { signal: ac.signal }),
+        )
       } finally {
+        jobAbortRef.current = null
         setHealthRunning(false)
       }
     },
@@ -705,9 +733,13 @@ export default function Workspace() {
       setHealthReport(report)
     },
     onError: (e: Error) => {
-      setError(e.message)
       setHealthOpen(false)
       setHealthReport(null)
+      if (e.message === 'Health check cancelled') {
+        setError(null)
+        return
+      }
+      setError(e.message)
     },
   })
 
@@ -715,11 +747,28 @@ export default function Workspace() {
     mutationFn: async () => {
       return await withTransfer('prune', 'Cleaning orphans…', applyPrune)
     },
-    onSuccess: async () => {
+    onSuccess: async (result) => {
       setError(null)
+      await qc.invalidateQueries({ queryKey: ['accounts', 'storage'] })
+      if (result.errors > 0) {
+        setError(
+          `Prune finished with ${result.errors} delete error(s). Some orphans may remain (often Drive folders the app cannot fully access).`,
+        )
+        setPruneReport(null)
+        setPruneAnalyzing(true)
+        try {
+          const report = await withTransfer('prune', 'Re-analyzing…', analyzePrune)
+          setPruneReport(report)
+        } catch (e) {
+          setPruneOpen(false)
+          setError(e instanceof Error ? e.message : String(e))
+        } finally {
+          setPruneAnalyzing(false)
+        }
+        return
+      }
       setPruneOpen(false)
       setPruneReport(null)
-      await qc.invalidateQueries({ queryKey: ['accounts', 'storage'] })
     },
     onError: (e: Error) => setError(e.message),
   })
@@ -748,12 +797,18 @@ export default function Workspace() {
   }
 
   const uploadMut = useMutation({
-    mutationFn: async (job: { destDir: string } & CollectedUploads) => {
+    mutationFn: async (
+      job: {
+        destDir: string
+        replacements?: Array<{ id: string; label: string }>
+      } & CollectedUploads,
+    ) => {
       const files = filterUploadItems(job.files)
       const emptyDirs = job.emptyDirs
         .map((d) => d.replace(/\\/g, '/').replace(/^\/+|\/+$/g, ''))
         .filter(Boolean)
-      if (files.length === 0 && emptyDirs.length === 0) {
+      const replacements = job.replacements ?? []
+      if (files.length === 0 && emptyDirs.length === 0 && replacements.length === 0) {
         throw new Error('Nothing to upload')
       }
       const ac = new AbortController()
@@ -762,9 +817,39 @@ export default function Workspace() {
       uploadFilePercentsRef.current = new Map()
       const labels = files.map((f) => f.relativePath)
       const status = qc.getQueryData<VaultStatus>(['vault', 'status'])
-      const fileConcurrency = Math.max(1, status?.shard_upload_concurrency ?? 1)
+      // Cap below browser HTTP/1.1 pool (SSE + PUT per file); see MAX_PARALLEL_UPLOAD_FILES.
+      const fileConcurrency = Math.max(
+        1,
+        Math.min(
+          status?.shard_upload_concurrency ?? 1,
+          MAX_PARALLEL_UPLOAD_FILES,
+        ),
+      )
       startBatchQueue('upload', labels, emptyDirs)
       try {
+        if (replacements.length > 0) {
+          setTransfer({
+            kind: 'upload',
+            percent: 0,
+            message: `Replacing ${replacements.length} existing file(s)…`,
+            itemLabel: null,
+            itemIndex: 0,
+            itemTotal: files.length,
+          })
+          for (let i = 0; i < replacements.length; i++) {
+            if (ac.signal.aborted) throw new Error('Upload cancelled')
+            const r = replacements[i]
+            setTransfer({
+              kind: 'upload',
+              percent: Math.round((i / Math.max(replacements.length, 1)) * 8),
+              message: `Deleting ${r.label}…`,
+              itemLabel: r.label,
+              itemIndex: 0,
+              itemTotal: files.length,
+            })
+            await deleteVaultFile(r.id)
+          }
+        }
         if (emptyDirs.length > 0) {
           setTransfer({
             kind: 'upload',
@@ -779,6 +864,7 @@ export default function Workspace() {
           if (ac.signal.aborted) throw new Error('Upload cancelled')
           await ensureVaultDirTree(joinVaultDir(job.destDir, dir))
         }
+        if (files.length === 0) return
         // Overlap small files so free shard slots stay busy (shared backend pool).
         await mapPool(files, fileConcurrency, async (item, i) => {
           if (ac.signal.aborted) throw new Error('Upload cancelled')
@@ -832,8 +918,67 @@ export default function Workspace() {
 
   function queueUpload(destDir: string, collected: CollectedUploads) {
     const files = filterUploadItems(collected.files)
-    if (files.length === 0 && collected.emptyDirs.length === 0) return
-    uploadMut.mutate({ destDir, files, emptyDirs: collected.emptyDirs })
+    const emptyDirs = collected.emptyDirs
+    if (files.length === 0 && emptyDirs.length === 0) return
+    void (async () => {
+      try {
+        setUploadConflictBusy(true)
+        const scan = await detectUploadConflicts(destDir, files)
+        if (scan.conflicts.length === 0) {
+          uploadMut.mutate({ destDir, files, emptyDirs })
+          return
+        }
+        const actions: Record<string, ConflictAction> = {}
+        for (const c of scan.conflicts) {
+          // Default: rename keeps both; replace only when a vault file exists.
+          actions[c.relativePath] = 'rename'
+        }
+        setUploadConflict({ destDir, files, emptyDirs, scan, actions })
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err))
+      } finally {
+        setUploadConflictBusy(false)
+      }
+    })()
+  }
+
+  function applyUploadConflictAction(action: ConflictAction) {
+    setUploadConflict((prev) => {
+      if (!prev) return prev
+      const actions = { ...prev.actions }
+      for (const c of prev.scan.conflicts) {
+        if (action === 'replace' && c.existingId == null) {
+          // Batch-only duplicate: replace still means keep the later file.
+          actions[c.relativePath] = 'replace'
+        } else {
+          actions[c.relativePath] = action
+        }
+      }
+      return { ...prev, actions }
+    })
+  }
+
+  function confirmUploadConflicts() {
+    if (!uploadConflict) return
+    const { destDir, files, emptyDirs, scan, actions } = uploadConflict
+    const plan = buildUploadPlan(
+      destDir,
+      files,
+      scan.conflicts,
+      actions,
+      scan.occupiedByParent,
+    )
+    setUploadConflict(null)
+    if (plan.files.length === 0 && emptyDirs.length === 0) {
+      setError('Nothing to upload after skipping conflicts')
+      return
+    }
+    uploadMut.mutate({
+      destDir,
+      files: plan.files,
+      emptyDirs,
+      replacements: plan.replacements,
+    })
   }
 
   async function uploadFromDataTransfer(destDir: string, dt: DataTransfer) {
@@ -953,17 +1098,24 @@ export default function Workspace() {
 
   const deleteFileMut = useMutation({
     mutationFn: async (entries: VaultEntry[]) => {
-      for (let i = 0; i < entries.length; i++) {
-        const entry = entries[i]
-        const onProg = (u: ProgressUpdate) => {
-          const mapped = batchProgress(i, entries.length, u)
-          setTransfer({ kind: 'delete', ...mapped })
+      const ac = new AbortController()
+      jobAbortRef.current = ac
+      try {
+        for (let i = 0; i < entries.length; i++) {
+          if (ac.signal.aborted) throw new Error('Delete cancelled')
+          const entry = entries[i]
+          const onProg = (u: ProgressUpdate) => {
+            const mapped = batchProgress(i, entries.length, u)
+            setTransfer({ kind: 'delete', ...mapped })
+          }
+          if (entry.kind === 'dir') {
+            await deleteVaultDir(entry.path, onProg, { signal: ac.signal })
+          } else {
+            await deleteVaultFile(entry.id, onProg, { signal: ac.signal })
+          }
         }
-        if (entry.kind === 'dir') {
-          await deleteVaultDir(entry.path, onProg)
-        } else {
-          await deleteVaultFile(entry.id, onProg)
-        }
+      } finally {
+        jobAbortRef.current = null
       }
     },
     onSuccess: async () => {
@@ -974,8 +1126,16 @@ export default function Workspace() {
       await qc.invalidateQueries({ queryKey: ['vault'] })
       await qc.invalidateQueries({ queryKey: ['accounts', 'storage'] })
     },
-    onError: (e: Error) => {
+    onError: async (e: Error) => {
       setTransfer(null)
+      if (e.message === 'Delete cancelled') {
+        setError(null)
+        setSelectedIds([])
+        setAnchorId(null)
+        await qc.invalidateQueries({ queryKey: ['vault'] })
+        await qc.invalidateQueries({ queryKey: ['accounts', 'storage'] })
+        return
+      }
       setError(e.message)
     },
   })
@@ -1042,7 +1202,8 @@ export default function Workspace() {
     deleteFileMut.isPending ||
     mkdirMut.isPending ||
     renameMut.isPending ||
-    moveMut.isPending
+    moveMut.isPending ||
+    uploadConflictBusy
 
   const accountsOpBusy =
     accountsLocked ||
@@ -1051,7 +1212,8 @@ export default function Workspace() {
     healthMut.isPending ||
     pruneAnalyzeMut.isPending ||
     pruneApplyMut.isPending ||
-    deleteAccountMut.isPending
+    deleteAccountMut.isPending ||
+    evacuateMut.isPending
 
   useEffect(() => {
     if (accountsOpBusy && accountsManage) setAccountsManage(false)
@@ -1078,10 +1240,39 @@ export default function Workspace() {
     ? `${statusQuery.data?.username ?? 'user'} · ${statusQuery.data?.file_count ?? 0} files · ${statusQuery.data?.account_count ?? 0} accounts`
     : 'locked'
 
-  function openDir(entry: VaultEntry) {
-    if (entry.kind !== 'dir') return
-    setPath(entry.path)
+  const previewMaxBytes =
+    statusQuery.data?.preview_max_bytes ?? DEFAULT_PREVIEW_MAX_BYTES
+
+  function parentDirOf(entryPath: string): string {
+    const i = entryPath.lastIndexOf('/')
+    if (i <= 0) return '/'
+    return entryPath.slice(0, i)
   }
+
+  function openEntry(entry: VaultEntry) {
+    if (searchActive) {
+      if (entry.kind === 'dir') {
+        setPath(entry.path)
+      } else {
+        pendingSelectRef.current = entry.id
+        setPath(parentDirOf(entry.path))
+      }
+      setSearchInput('')
+      return
+    }
+    if (entry.kind === 'dir') {
+      setPath(entry.path)
+      return
+    }
+    const kind = previewOpenKind(entry, previewMaxBytes)
+    if (!kind) return
+    setFilePreview({ entry, kind })
+  }
+
+  const previewImagePeers = useMemo(
+    () => previewableImagesInFolder(entries ?? [], previewMaxBytes),
+    [entries, previewMaxBytes],
+  )
 
   function goCrumb(index: number) {
     if (index < 0) {
@@ -1297,6 +1488,9 @@ export default function Workspace() {
         <div className="top-bar-title">Cloud Storage</div>
         <div className="top-bar-status">{statusText}</div>
         <div className="toolbar">
+          <Link to="/history" className="btn">
+            History
+          </Link>
           <button
             type="button"
             className="btn"
@@ -1320,108 +1514,6 @@ export default function Workspace() {
             ×
           </button>
         </div>
-      ) : null}
-
-      {transfer ? (
-        <div className="transfer-bar">
-          <div className="transfer-meta">
-            <span className="transfer-kind">{TRANSFER_LABELS[transfer.kind]}</span>
-            <span className="transfer-msg">{transfer.message}</span>
-            {transfer.itemTotal != null && transfer.itemTotal > 0 ? (
-              <span className="transfer-stats" title="Files in this batch">
-                {(transfer.itemIndex ?? 0) + 1}/{transfer.itemTotal} files
-              </span>
-            ) : null}
-            <span className="transfer-pct">{transfer.percent}%</span>
-            {(transfer.kind === 'upload' || transfer.kind === 'download') &&
-            transfer.doneShards != null ? (
-              <span className="transfer-stats" title="Shards done / expected · active">
-                {transfer.doneShards}
-                {transfer.expectedShards != null ? `/${transfer.expectedShards}` : ''} sh
-                {(transfer.activeShards ?? 0) > 0 ? (
-                  <span className="transfer-active"> · {transfer.activeShards} active</span>
-                ) : null}
-              </span>
-            ) : null}
-            {(transfer.kind === 'upload' || transfer.kind === 'download') &&
-            transfer.doneBytes != null ? (
-              <span className="transfer-stats" title="Transferred / total">
-                {formatBytes(transfer.doneBytes)}
-                {transfer.totalBytes != null ? ` / ${formatBytes(transfer.totalBytes)}` : ''}
-              </span>
-            ) : null}
-            {transfer.kind === 'upload' || transfer.kind === 'download' ? (
-              <span className="transfer-stats" title="1 min average">
-                {formatRate(transfer.shardsPerSec, 'sh/s')} · {formatRate(transfer.mbPerSec, 'MB/s')}
-              </span>
-            ) : null}
-            {transfer.kind === 'upload' ? (
-              <button
-                type="button"
-                className="btn-micro btn-danger"
-                onClick={() => uploadAbortRef.current?.abort()}
-              >
-                Cancel
-              </button>
-            ) : null}
-            {transfer.kind === 'download' ? (
-              <button
-                type="button"
-                className="btn-micro btn-danger"
-                onClick={() => downloadAbortRef.current?.abort()}
-              >
-                Cancel
-              </button>
-            ) : null}
-          </div>
-          {(transfer.kind === 'upload' || transfer.kind === 'download') &&
-          (transfer.expectedShards != null || (transfer.doneShards ?? 0) > 0) ? (
-            <ShardBoxesBar
-              done={transfer.doneShards ?? 0}
-              active={transfer.activeShards ?? 0}
-              total={Math.max(
-                transfer.expectedShards ?? 0,
-                (transfer.doneShards ?? 0) + (transfer.activeShards ?? 0),
-                1,
-              )}
-            />
-          ) : (
-            <div className="transfer-track">
-              <div className="transfer-fill" style={{ width: `${transfer.percent}%` }} />
-            </div>
-          )}
-          {transfer.itemLabel ? (
-            <div className="transfer-queue">
-              <div className="transfer-queue-row">
-                <span className="transfer-queue-label">Current</span>
-                <span className="transfer-file" title={transfer.itemLabel}>
-                  {transfer.itemLabel}
-                </span>
-              </div>
-            </div>
-          ) : null}
-        </div>
-      ) : null}
-
-      {batchQueue?.visible ? (
-        <TransferBatchPanel
-          kind={batchQueue.kind}
-          tree={batchQueue.tree}
-          statuses={batchQueue.statuses}
-          onClose={() => setBatchQueue((q) => (q ? { ...q, visible: false } : q))}
-        />
-      ) : null}
-
-      {batchQueue && !batchQueue.visible ? (
-        <button
-          type="button"
-          className="transfer-batch-reopen"
-          onClick={() => setBatchQueue((q) => (q ? { ...q, visible: true } : q))}
-          title="Show transfer queue"
-          aria-label="Show transfer queue"
-        >
-          Queue
-        </button>
       ) : null}
 
       <div className="workspace">
@@ -1517,6 +1609,18 @@ export default function Workspace() {
                       {accountsQuery.data.map((account: Account) => {
                         const stats = storageById.get(account.id)
                         const pct = storagePct(stats?.used ?? null, stats?.total ?? null)
+                        const vaultBytes = stats?.vault_used ?? 0
+                        const usedBytes = stats?.used
+                        // Clamp vault segment inside used so estimate noise cannot overflow the bar.
+                        const vaultInUsed =
+                          usedBytes != null ? Math.min(vaultBytes, Math.max(0, usedBytes)) : vaultBytes
+                        const vaultPct = storagePct(vaultInUsed, stats?.total ?? null)
+                        const otherPct =
+                          pct != null && vaultPct != null
+                            ? Math.max(0, pct - vaultPct)
+                            : pct != null
+                              ? pct
+                              : null
                         const uploadEnabled = account.enabled !== false
                         const uploadRow =
                           transfer?.kind === 'upload' || transfer?.kind === 'download'
@@ -1580,11 +1684,36 @@ export default function Workspace() {
                                 </span>
                               ) : (
                                 <>
-                                  <div className="storage-track">
-                                    <div
-                                      className={`storage-fill${stats?.full ? ' storage-fill-full' : ''}`}
-                                      style={{ width: `${pct ?? 0}%` }}
-                                    />
+                                  <div
+                                    className="storage-track"
+                                    title={[
+                                      `Used ${formatBytes(stats?.used ?? null)}`,
+                                      `vault ${formatBytes(vaultBytes)}`,
+                                      stats?.total == null
+                                        ? null
+                                        : `of ${formatBytes(stats.total)}`,
+                                    ]
+                                      .filter(Boolean)
+                                      .join(' · ')}
+                                  >
+                                    {vaultPct != null && vaultPct > 0 ? (
+                                      <div
+                                        className="storage-fill storage-fill-vault"
+                                        style={{ width: `${vaultPct}%` }}
+                                      />
+                                    ) : null}
+                                    {otherPct != null && otherPct > 0 ? (
+                                      <div
+                                        className={`storage-fill${stats?.full ? ' storage-fill-full' : ''}`}
+                                        style={{ width: `${otherPct}%` }}
+                                      />
+                                    ) : null}
+                                    {vaultPct == null && otherPct == null && (pct ?? 0) > 0 ? (
+                                      <div
+                                        className={`storage-fill${stats?.full ? ' storage-fill-full' : ''}`}
+                                        style={{ width: `${pct ?? 0}%` }}
+                                      />
+                                    ) : null}
                                   </div>
                                   <div className="storage-meta">
                                     <span>
@@ -1592,6 +1721,13 @@ export default function Workspace() {
                                       {' / '}
                                       {stats?.total == null ? '∞' : formatBytes(stats.total)}
                                       {stats?.full ? ' · full' : ''}
+                                      {' · '}
+                                      <span
+                                        className="storage-vault-label"
+                                        title="Estimated ciphertext for vault shards + thumbs"
+                                      >
+                                        vault {formatBytes(vaultBytes)}
+                                      </span>
                                     </span>
                                     <span>
                                       {stats?.placeable == null
@@ -1737,7 +1873,11 @@ export default function Workspace() {
                     title={`Upload files into ${path}`}
                     onClick={() => fileInputRef.current?.click()}
                   >
-                    {uploadMut.isPending ? 'Uploading…' : 'Upload'}
+                    {uploadMut.isPending
+                      ? 'Uploading…'
+                      : uploadConflictBusy
+                        ? 'Checking…'
+                        : 'Upload'}
                   </button>
                   <button
                     type="button"
@@ -1746,7 +1886,7 @@ export default function Workspace() {
                     title={`Upload a folder into ${path}`}
                     onClick={() => folderInputRef.current?.click()}
                   >
-                    Upload folder
+                    {uploadConflictBusy ? 'Checking…' : 'Upload folder'}
                   </button>
                   <button
                     type="button"
@@ -1888,13 +2028,208 @@ export default function Workspace() {
                 </span>
               </div>
 
+              <div className="vault-search">
+                <input
+                  className="input vault-search-input"
+                  type="search"
+                  placeholder={
+                    searchRegex ? 'Regex on name…' : 'Search names…'
+                  }
+                  value={searchInput}
+                  onChange={(e) => setSearchInput(e.target.value)}
+                  aria-label="Search files and folders"
+                />
+                <select
+                  className="input vault-search-select"
+                  value={searchKind}
+                  onChange={(e) => setSearchKind(e.target.value as VaultSearchKind)}
+                  aria-label="Search kind"
+                >
+                  <option value="all">All</option>
+                  <option value="file">Files</option>
+                  <option value="dir">Folders</option>
+                </select>
+                <select
+                  className="input vault-search-select"
+                  value={searchScope}
+                  onChange={(e) =>
+                    setSearchScope(e.target.value as VaultSearchScope)
+                  }
+                  aria-label="Search scope"
+                >
+                  <option value="folder">This folder</option>
+                  <option value="global">Global</option>
+                </select>
+                <label className="vault-search-regex">
+                  <input
+                    type="checkbox"
+                    checked={searchRegex}
+                    onChange={(e) => setSearchRegex(e.target.checked)}
+                  />
+                  Regex
+                </label>
+                {searchInput ? (
+                  <button
+                    type="button"
+                    className="btn-micro"
+                    onClick={() => setSearchInput('')}
+                  >
+                    Clear
+                  </button>
+                ) : null}
+                {searchActive && searchQuery.data?.truncated ? (
+                  <span className="list-row-meta">Truncated</span>
+                ) : null}
+              </div>
+
               <div
                 className={`panel-body${dropTarget === path ? ' vault-drop-active' : ''}`}
                 onDragOver={(e) => onDragOverDest(path, e)}
                 onDragLeave={() => setDropTarget((t) => (t === path ? null : t))}
                 onDrop={(e) => onDropOnto(path, e)}
               >
-                {filesQuery.isLoading ? (
+                {searchActive ? (
+                  searchQuery.isError ? (
+                    <div className="empty-hint" style={{ color: 'var(--error)' }}>
+                      {(searchQuery.error as Error).message}
+                      {(searchQuery.error as Error).message
+                        .toLowerCase()
+                        .includes('not found')
+                        ? ' (restart the backend if you just added search)'
+                        : ''}
+                    </div>
+                  ) : searchQuery.isLoading && !searchQuery.data ? (
+                    <div className="empty-hint">Searching…</div>
+                  ) : entries && entries.length > 0 ? (
+                    fileView === 'grid' ? (
+                      <>
+                        <div className="file-grid-toolbar">
+                          <input
+                            type="checkbox"
+                            className="file-check"
+                            checked={allFilesSelected}
+                            disabled={fileEntries.length === 0 || busy}
+                            onChange={toggleSelectAllFiles}
+                            aria-label="Select all files"
+                          />
+                          <span className="list-row-meta">
+                            {selectedIds.length > 0
+                              ? `${selectedIds.length} selected`
+                              : `${entries.length} match${entries.length === 1 ? '' : 'es'}`}
+                          </span>
+                        </div>
+                        <div className="file-grid">
+                          {entries.map((entry) => {
+                            const isSelected = selectedIds.includes(entry.id)
+                            return (
+                              <div
+                                key={entry.id}
+                                className={[
+                                  'file-grid-item',
+                                  isSelected ? 'selected' : '',
+                                ]
+                                  .filter(Boolean)
+                                  .join(' ')}
+                                onClick={(e) => selectEntry(entry, e)}
+                                onDoubleClick={() => openEntry(entry)}
+                                title={entry.path}
+                              >
+                                <input
+                                  type="checkbox"
+                                  className="file-grid-check"
+                                  checked={isSelected}
+                                  disabled={busy}
+                                  onClick={(e) => e.stopPropagation()}
+                                  onChange={(e) =>
+                                    onEntryCheckChange(entry, e.target.checked)
+                                  }
+                                  aria-label={`Select ${entry.name}`}
+                                />
+                                <FileThumb entry={entry} size="lg" />
+                                <span className={`file-grid-name ${entry.kind}`}>
+                                  {entry.name}
+                                </span>
+                                <span className="file-grid-meta" title={entry.path}>
+                                  {entry.path}
+                                </span>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      </>
+                    ) : (
+                      <table className="file-table">
+                        <thead>
+                          <tr>
+                            <th className="col-check">
+                              <input
+                                type="checkbox"
+                                className="file-check"
+                                checked={allFilesSelected}
+                                disabled={fileEntries.length === 0 || busy}
+                                onChange={toggleSelectAllFiles}
+                                aria-label="Select all files"
+                              />
+                            </th>
+                            <th className="col-thumb" aria-label="Preview" />
+                            <th>Name</th>
+                            <th>Path</th>
+                            <th>Size</th>
+                            <th>Shards</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {entries.map((entry) => {
+                            const isSelected = selectedIds.includes(entry.id)
+                            return (
+                              <tr
+                                key={entry.id}
+                                className={isSelected ? 'selected' : undefined}
+                                onClick={(e) => selectEntry(entry, e)}
+                                onDoubleClick={() => openEntry(entry)}
+                              >
+                                <td
+                                  className="col-check"
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  <input
+                                    type="checkbox"
+                                    className="file-check"
+                                    checked={isSelected}
+                                    disabled={busy}
+                                    onChange={(e) =>
+                                      onEntryCheckChange(entry, e.target.checked)
+                                    }
+                                    aria-label={`Select ${entry.name}`}
+                                  />
+                                </td>
+                                <td className="col-thumb">
+                                  <FileThumb entry={entry} />
+                                </td>
+                                <td>
+                                  <span className={`file-name ${entry.kind}`}>
+                                    {entry.name}
+                                  </span>
+                                </td>
+                                <td className="list-row-meta" title={entry.path}>
+                                  {entry.path}
+                                </td>
+                                <td className="list-row-meta">
+                                  {formatBytes(entry.size)}
+                                </td>
+                                <td className="list-row-meta">
+                                  {entry.kind === 'file' ? entry.shard_count : '—'}
+                                </td>
+                              </tr>
+                            )
+                          })}
+                        </tbody>
+                      </table>
+                    )
+                  ) : (
+                    <div className="empty-hint">No matches.</div>
+                  )
+                ) : filesQuery.isLoading ? (
                   <div className="empty-hint">Loading…</div>
                 ) : entries && entries.length > 0 ? (
                   fileView === 'grid' ? (
@@ -1931,7 +2266,7 @@ export default function Workspace() {
                                 .join(' ')}
                               {...entryDragProps(entry)}
                               onClick={(e) => selectEntry(entry, e)}
-                              onDoubleClick={() => openDir(entry)}
+                              onDoubleClick={() => openEntry(entry)}
                               title={entry.name}
                             >
                               <input
@@ -1995,7 +2330,7 @@ export default function Workspace() {
                                 .join(' ') || undefined}
                               {...entryDragProps(entry)}
                               onClick={(e) => selectEntry(entry, e)}
-                              onDoubleClick={() => openDir(entry)}
+                              onDoubleClick={() => openEntry(entry)}
                             >
                               <td
                                 className="col-check"
@@ -2303,6 +2638,128 @@ export default function Workspace() {
         </div>
       ) : null}
 
+      {filePreview ? (
+        <FilePreviewDialog
+          entry={filePreview.entry}
+          kind={filePreview.kind}
+          imagePeers={previewImagePeers}
+          maxBytes={previewMaxBytes}
+          onClose={() => setFilePreview(null)}
+          onDownload={(e) => downloadMut.mutate([e])}
+          onChangeEntry={(e) => setFilePreview({ entry: e, kind: 'image' })}
+        />
+      ) : null}
+
+      {uploadConflict ? (
+        <div
+          className="modal-backdrop"
+          onClick={() => {
+            if (!uploadMut.isPending) setUploadConflict(null)
+          }}
+        >
+          <div className="modal modal-wide" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">Upload conflicts</div>
+            <div className="modal-body">
+              <div className="conflict-summary">
+                <span className="data">{uploadConflict.scan.conflicts.length}</span>{' '}
+                {uploadConflict.scan.conflicts.length === 1
+                  ? 'name already exists'
+                  : 'names already exist'}
+                . Choose replace, skip, or auto-rename for each.
+              </div>
+              <div className="conflict-apply-all">
+                <span className="field-label">Apply to all</span>
+                <div className="conflict-apply-btns">
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => applyUploadConflictAction('replace')}
+                  >
+                    Replace
+                  </button>
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => applyUploadConflictAction('skip')}
+                  >
+                    Skip
+                  </button>
+                  <button
+                    type="button"
+                    className="btn"
+                    onClick={() => applyUploadConflictAction('rename')}
+                  >
+                    Rename
+                  </button>
+                </div>
+              </div>
+              <div className="conflict-scroll">
+                {uploadConflict.scan.conflicts.map((c) => {
+                  const action = uploadConflict.actions[c.relativePath] ?? 'rename'
+                  return (
+                    <div key={c.relativePath} className="conflict-row">
+                      <div className="conflict-path" title={c.relativePath}>
+                        {c.relativePath}
+                      </div>
+                      <div className="conflict-meta">
+                        {c.existingId
+                          ? 'Exists in vault'
+                          : 'Duplicate in this upload'}
+                        {action === 'rename' ? (
+                          <>
+                            {' → '}
+                            <span className="data">{c.suggestedName}</span>
+                            {' (auto)'}
+                          </>
+                        ) : null}
+                      </div>
+                      <select
+                        className="input conflict-action"
+                        value={action}
+                        onChange={(e) => {
+                          const next = e.target.value as ConflictAction
+                          setUploadConflict((prev) =>
+                            prev
+                              ? {
+                                  ...prev,
+                                  actions: {
+                                    ...prev.actions,
+                                    [c.relativePath]: next,
+                                  },
+                                }
+                              : prev,
+                          )
+                        }}
+                      >
+                        <option value="replace">Replace</option>
+                        <option value="skip">Skip</option>
+                        <option value="rename">Rename</option>
+                      </select>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="btn"
+                onClick={() => setUploadConflict(null)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn-primary"
+                onClick={() => confirmUploadConflicts()}
+              >
+                Continue upload
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
       {pruneOpen ? (
         <div
           className="modal-backdrop"
@@ -2372,8 +2829,19 @@ export default function Workspace() {
                           {row.orphans.length > 0 ? (
                             <ul className="prune-list">
                               {row.orphans.map((o) => (
-                                <li key={o.id}>
-                                  {o.kind}: {o.name}
+                                <li key={o.id} title={`${o.kind}: ${o.name}`}>
+                                  {o.kind}:{' '}
+                                  {o.path ? (
+                                    <>
+                                      <span className="data">{o.path}</span>
+                                      <span className="prune-account-meta">
+                                        {' '}
+                                        ({o.name})
+                                      </span>
+                                    </>
+                                  ) : (
+                                    o.name
+                                  )}
                                 </li>
                               ))}
                             </ul>
@@ -2524,6 +2992,15 @@ export default function Workspace() {
               )}
             </div>
             <div className="modal-actions">
+              {healthRunning ? (
+                <button
+                  type="button"
+                  className="btn-danger"
+                  onClick={() => jobAbortRef.current?.abort()}
+                >
+                  Cancel
+                </button>
+              ) : null}
               <button
                 type="button"
                 className="btn-primary"
@@ -2534,6 +3011,77 @@ export default function Workspace() {
                 }}
               >
                 Close
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {evacuateOpen && evacuateDetail ? (
+        <div
+          className="modal-backdrop"
+          onClick={() => {
+            if (!evacuateMut.isPending) {
+              setEvacuateOpen(false)
+              setEvacuateDetail(null)
+            }
+          }}
+        >
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">Account still holds data</div>
+            <div className="modal-body">
+              <div className="prune-summary">
+                <span className="list-row-label" title={evacuateDetail.label ?? undefined}>
+                  {evacuateDetail.label || evacuateDetail.account_id}
+                </span>
+                {' holds '}
+                {evacuateDetail.shard_count > 0 ? (
+                  <>
+                    <span className="data">{evacuateDetail.shard_count}</span> shard
+                    {evacuateDetail.shard_count === 1 ? '' : 's'} in{' '}
+                    <span className="data">{evacuateDetail.file_count}</span> file
+                    {evacuateDetail.file_count === 1 ? '' : 's'}
+                  </>
+                ) : null}
+                {evacuateDetail.shard_count > 0 && evacuateDetail.thumb_count > 0
+                  ? ' and '
+                  : null}
+                {evacuateDetail.thumb_count > 0 ? (
+                  <>
+                    <span className="data">{evacuateDetail.thumb_count}</span> thumbnail
+                    {evacuateDetail.thumb_count === 1 ? '' : 's'}
+                  </>
+                ) : null}
+                .
+              </div>
+              {evacuateDetail.sample_paths.length > 0 ? (
+                <div className="prune-empty" title={evacuateDetail.sample_paths.join(', ')}>
+                  Examples: {evacuateDetail.sample_paths.slice(0, 3).join(', ')}
+                </div>
+              ) : null}
+              <div className="prune-empty">
+                Move this data onto your other enabled accounts, then disconnect.
+              </div>
+            </div>
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="btn"
+                disabled={evacuateMut.isPending}
+                onClick={() => {
+                  setEvacuateOpen(false)
+                  setEvacuateDetail(null)
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="btn-primary"
+                disabled={evacuateMut.isPending}
+                onClick={() => evacuateMut.mutate(evacuateDetail.account_id)}
+              >
+                {evacuateMut.isPending ? 'Moving…' : 'Move data & disconnect'}
               </button>
             </div>
           </div>

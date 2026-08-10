@@ -17,6 +17,8 @@ from config import (
 )
 from deps import require_accounts_manageable
 from storage import accounts as accounts_store
+from storage import activity as activity_store
+from storage import auth_context
 
 router = APIRouter(prefix="/api/auth/google", tags=["auth"])
 
@@ -63,9 +65,17 @@ def google_callback(request: Request, code: str | None = None, state: str | None
     # Session must still be unlocked so we can encrypt stored credentials.
     # Also refuse to finish connecting while the user has a running transfer.
     require_accounts_manageable(request)
+    user_id = auth_context.require_user_id()
     if not google_configured():
         raise HTTPException(status_code=503, detail="Google OAuth is not configured")
     if not code or not state or state != request.session.get("oauth_state"):
+        activity_store.record(
+            user_id,
+            "account_connect",
+            "error",
+            detail="Invalid OAuth state",
+            meta={"provider": "gdrive"},
+        )
         raise HTTPException(status_code=400, detail="Invalid OAuth state")
 
     code_verifier = request.session.pop("oauth_code_verifier", None)
@@ -77,7 +87,15 @@ def google_callback(request: Request, code: str | None = None, state: str | None
     try:
         flow.fetch_token(code=code)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Google token exchange failed: {exc}") from exc
+        detail = f"Google token exchange failed: {exc}"
+        activity_store.record(
+            user_id,
+            "account_connect",
+            "error",
+            detail=detail,
+            meta={"provider": "gdrive"},
+        )
+        raise HTTPException(status_code=400, detail=detail) from exc
 
     creds = flow.credentials
 
@@ -86,13 +104,24 @@ def google_callback(request: Request, code: str | None = None, state: str | None
     email = info.get("email") or "gdrive"
 
     expiry = creds.expiry.isoformat() if creds.expiry is not None else None
-    accounts_store.add_account(
+    account = accounts_store.add_account(
         provider="gdrive",
         label=email,
         credentials={
             "token": creds.token,
             "refresh_token": creds.refresh_token,
             "expiry": expiry,
+        },
+    )
+    activity_store.record(
+        user_id,
+        "account_connect",
+        "success",
+        path=email,
+        meta={
+            "provider": "gdrive",
+            "account_id": account.get("id"),
+            "label": email,
         },
     )
     return RedirectResponse(f"{FRONTEND_URL.rstrip('/')}/?connected=gdrive")

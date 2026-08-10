@@ -16,15 +16,32 @@ from googleapiclient.discovery import Resource, build
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
 from config import (
+    DELETE_CONCURRENCY,
+    GDRIVE_ACCOUNT_DOWNLOAD_CONCURRENCY,
+    GDRIVE_ACCOUNT_UPLOAD_CONCURRENCY,
     GOOGLE_CLIENT_ID,
     GOOGLE_CLIENT_SECRET,
     GOOGLE_SCOPES,
+    HEALTH_CHECK_CONCURRENCY,
+    PROVIDER_OP_RETRIES,
     PROVIDER_OP_TIMEOUT,
     SHARD_FOLDER_NAME,
 )
+from providers.retry import call_with_retries
 from storage import accounts as accounts_store
 
 log = logging.getLogger(__name__)
+
+
+def _timeout_pool_workers() -> int:
+    """Enough workers for parallel shard/health/delete ops on one Drive account."""
+    return max(
+        1,
+        GDRIVE_ACCOUNT_UPLOAD_CONCURRENCY,
+        GDRIVE_ACCOUNT_DOWNLOAD_CONCURRENCY,
+        HEALTH_CHECK_CONCURRENCY,
+        DELETE_CONCURRENCY,
+    )
 
 
 def _parse_expiry(raw: Any) -> datetime | None:
@@ -78,9 +95,9 @@ class GDriveProvider:
         self._local = threading.local()
         self._folder_id: str | None = None
         self._folder_lock = threading.Lock()
-        # One pool reused across ops so thread-local Drive clients stick around.
+        # Pool sized for parallel shard/health ops; thread-local Drive clients stick.
         self._timeout_pool = ThreadPoolExecutor(
-            max_workers=1,
+            max_workers=_timeout_pool_workers(),
             thread_name_prefix="gdrive-op",
         )
         self._ensure_fresh_credentials()
@@ -182,14 +199,20 @@ class GDriveProvider:
             self._folder_id = self._find_or_create_folder(SHARD_FOLDER_NAME)
             return self._folder_id
 
-    def ensure_file_folder(self, file_id: str) -> str:
-        """Per-upload folder under the vault root (cancel deletes this in one call)."""
+    def ensure_child_folder(self, name: str, *, parent_id: str | None = None) -> str:
+        """Opaque folder under ``parent_id``, or under the vault root when omitted."""
 
         def _do() -> str:
-            root_id = self._ensure_folder()
-            return self._find_or_create_folder(file_id, parent_id=root_id)
+            parent = parent_id if parent_id is not None else self._ensure_folder()
+            return self._find_or_create_folder(name, parent_id=parent)
 
-        return self._run_timed(_do, op=f"ensure_file_folder name={file_id}")
+        return self._run_timed(
+            _do, op=f"ensure_child_folder name={name} parent={parent_id or 'vault'}"
+        )
+
+    def ensure_file_folder(self, file_id: str, *, parent_id: str | None = None) -> str:
+        """Per-upload folder (cancel deletes this in one call)."""
+        return self.ensure_child_folder(file_id, parent_id=parent_id)
 
     def list_vault_children(self) -> list[dict[str, str]]:
         """List immediate children of the vault root folder."""
@@ -242,7 +265,7 @@ class GDriveProvider:
             self._drop_thread_service()
             old_pool = self._timeout_pool
             self._timeout_pool = ThreadPoolExecutor(
-                max_workers=1,
+                max_workers=_timeout_pool_workers(),
                 thread_name_prefix="gdrive-op",
             )
             old_pool.shutdown(wait=False, cancel_futures=True)
@@ -259,27 +282,34 @@ class GDriveProvider:
         log.info("gdrive upload start name=%s bytes=%s", remote_id, len(data))
         t0 = time.monotonic()
 
-        def _do() -> str:
-            folder_id = parent_id if parent_id is not None else self._ensure_folder()
-            media = MediaIoBaseUpload(
-                io.BytesIO(data),
-                mimetype="application/octet-stream",
-                resumable=False,
-            )
-            created = (
-                self._service()
-                .files()
-                .create(
-                    body={"name": remote_id, "parents": [folder_id]},
-                    media_body=media,
-                    fields="id",
+        def _once() -> str:
+            def _do() -> str:
+                folder_id = parent_id if parent_id is not None else self._ensure_folder()
+                media = MediaIoBaseUpload(
+                    io.BytesIO(data),
+                    mimetype="application/octet-stream",
+                    resumable=False,
                 )
-                .execute()
-            )
-            return created["id"]
+                created = (
+                    self._service()
+                    .files()
+                    .create(
+                        body={"name": remote_id, "parents": [folder_id]},
+                        media_body=media,
+                        fields="id",
+                    )
+                    .execute()
+                )
+                return created["id"]
+
+            return self._run_timed(_do, op=f"upload name={remote_id}")
 
         try:
-            file_id = self._run_timed(_do, op=f"upload name={remote_id}")
+            file_id = call_with_retries(
+                _once,
+                op=f"gdrive upload name={remote_id}",
+                attempts=PROVIDER_OP_RETRIES,
+            )
         except Exception:
             log.exception(
                 "gdrive upload failed name=%s bytes=%s elapsed=%.2fs",
@@ -298,16 +328,23 @@ class GDriveProvider:
         return file_id
 
     def download(self, remote_id: str) -> bytes:
-        def _do() -> bytes:
-            request = self._service().files().get_media(fileId=remote_id)
-            buffer = io.BytesIO()
-            downloader = MediaIoBaseDownload(buffer, request)
-            done = False
-            while not done:
-                _, done = downloader.next_chunk()
-            return buffer.getvalue()
+        def _once() -> bytes:
+            def _do() -> bytes:
+                request = self._service().files().get_media(fileId=remote_id)
+                buffer = io.BytesIO()
+                downloader = MediaIoBaseDownload(buffer, request)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+                return buffer.getvalue()
 
-        return self._run_timed(_do, op=f"download id={remote_id}")
+            return self._run_timed(_do, op=f"download id={remote_id}")
+
+        return call_with_retries(
+            _once,
+            op=f"gdrive download id={remote_id}",
+            attempts=PROVIDER_OP_RETRIES,
+        )
 
     def exists(self, remote_id: str) -> bool:
         def _do() -> bool:
@@ -315,27 +352,113 @@ class GDriveProvider:
                 self._service().files().get(fileId=remote_id, fields="id").execute()
                 return True
             except Exception as exc:
-                status = getattr(getattr(exc, "resp", None), "status", None)
-                if status == 404:
-                    return False
-                err = str(exc).lower()
-                if "404" in err or "not found" in err or "file not found" in err:
+                if self._is_not_found(exc):
                     return False
                 raise
 
         return self._run_timed(_do, op=f"exists id={remote_id}")
 
-    def delete(self, remote_id: str) -> None:
+    def _is_not_found(self, exc: BaseException) -> bool:
+        status = getattr(getattr(exc, "resp", None), "status", None)
+        if status == 404:
+            return True
+        err = str(exc).lower()
+        return "404" in err or "not found" in err or "file not found" in err
+
+    def _get_mime_type(self, remote_id: str) -> str | None:
+        """Return mime type, or None if the file is already gone."""
+
+        def _do() -> str | None:
+            try:
+                meta = (
+                    self._service()
+                    .files()
+                    .get(fileId=remote_id, fields="id, mimeType")
+                    .execute()
+                )
+            except Exception as exc:
+                if self._is_not_found(exc):
+                    return None
+                raise
+            return meta.get("mimeType") or ""
+
+        return self._run_timed(_do, op=f"get mime id={remote_id}")
+
+    def _list_direct_children(self, parent_id: str) -> list[dict[str, str]]:
+        """List immediate children; each list page is individually timed."""
+        out: list[dict[str, str]] = []
+        page_token: str | None = None
+        query = f"'{parent_id}' in parents and trashed = false"
+
+        while True:
+            token = page_token
+
+            def _do(page: str | None = token) -> tuple[list[dict[str, str]], str | None]:
+                response = (
+                    self._service()
+                    .files()
+                    .list(
+                        q=query,
+                        spaces="drive",
+                        fields="nextPageToken, files(id, name, mimeType)",
+                        pageSize=100,
+                        pageToken=page,
+                    )
+                    .execute()
+                )
+                page_items: list[dict[str, str]] = []
+                for item in response.get("files", []):
+                    page_items.append(
+                        {
+                            "id": item["id"],
+                            "name": item.get("name") or "",
+                            "mimeType": item.get("mimeType") or "",
+                        }
+                    )
+                return page_items, response.get("nextPageToken")
+
+            items, page_token = self._run_timed(
+                _do, op=f"list children parent={parent_id}"
+            )
+            out.extend(items)
+            if not page_token:
+                break
+        return out
+
+    def _delete_one(self, remote_id: str) -> None:
         def _do() -> None:
             try:
                 self._service().files().delete(fileId=remote_id).execute()
-            except Exception:
-                pass
+            except Exception as exc:
+                if self._is_not_found(exc):
+                    return
+                raise
 
+        self._run_timed(_do, op=f"delete id={remote_id}")
+
+    def delete(self, remote_id: str) -> None:
+        """Delete a file/folder. Folders are emptied first (drive.file scope).
+
+        Each Drive API call has its own ``PROVIDER_OP_TIMEOUT`` so a deep
+        vault-dir tree is not killed by a single wall-clock budget.
+        """
+        folder_mime = "application/vnd.google-apps.folder"
         try:
-            self._run_timed(_do, op=f"delete id={remote_id}")
+            mime = self._get_mime_type(remote_id)
+            if mime is None:
+                return
+            if mime == folder_mime:
+                for child in self._list_direct_children(remote_id):
+                    self.delete(child["id"])
+            self._delete_one(remote_id)
         except TimeoutError:
-            pass
+            log.warning("gdrive delete timed out id=%s", remote_id)
+            raise
+        except Exception as exc:
+            if self._is_not_found(exc):
+                return
+            log.warning("gdrive delete failed id=%s: %s", remote_id, exc)
+            raise
 
     def quota(self) -> dict[str, int | None]:
         def _do() -> dict[str, int | None]:

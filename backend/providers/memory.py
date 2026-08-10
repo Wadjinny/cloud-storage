@@ -41,13 +41,21 @@ class MemoryProvider:
             cls._used = 0
             cls._folders.setdefault(cls.VAULT_ROOT_ID, set())
 
-    def ensure_file_folder(self, file_id: str) -> str:
-        folder_id = f"dir_{file_id}"
+    def ensure_child_folder(self, name: str, *, parent_id: str | None = None) -> str:
+        parent = parent_id if parent_id is not None else self.VAULT_ROOT_ID
+        folder_id = f"dir_{parent}_{name}"
         with self._lock:
-            self._folders.setdefault(self.VAULT_ROOT_ID, set()).add(folder_id)
+            # Reuse existing child with the same display name under parent.
+            for child_id in self._folders.get(parent, set()):
+                if self._folder_names.get(child_id) == name and child_id in self._folders:
+                    return child_id
+            self._folders.setdefault(parent, set()).add(folder_id)
             self._folders.setdefault(folder_id, set())
-            self._folder_names[folder_id] = file_id
+            self._folder_names[folder_id] = name
         return folder_id
+
+    def ensure_file_folder(self, file_id: str, *, parent_id: str | None = None) -> str:
+        return self.ensure_child_folder(file_id, parent_id=parent_id)
 
     def list_vault_children(self) -> list[dict[str, str]]:
         with self._lock:

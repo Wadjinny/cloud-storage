@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+from providers.memory import MemoryProvider
 from tests.helpers import upload_bytes, wait_job
 
 
@@ -73,3 +74,62 @@ def test_delete_folder_recursive(unlocked_client: TestClient) -> None:
     assert job["status"] == "done", job
     root = unlocked_client.get("/api/vault/files").json()
     assert not any(e["name"] == "wipe" for e in root)
+
+
+def test_upload_nests_under_vault_dir_ids(unlocked_client: TestClient) -> None:
+    file_id = upload_bytes(unlocked_client, b"nested", filename="n.bin", path="/album")
+    listing = unlocked_client.get("/api/vault/files").json()
+    album = next(e for e in listing if e["kind"] == "dir" and e["name"] == "album")
+    children = MemoryProvider({}).list_vault_children()
+    root_names = {c["name"] for c in children}
+    # Opaque vault-dir id at provider root; per-file folder nested under it.
+    assert album["id"] in root_names
+    assert file_id not in root_names
+
+
+def test_delete_folder_uses_fast_remote_tree(unlocked_client: TestClient) -> None:
+    upload_bytes(unlocked_client, b"one", filename="a.txt", path="/fastwipe")
+    upload_bytes(unlocked_client, b"two", filename="b.txt", path="/fastwipe/nested")
+    listing = unlocked_client.get("/api/vault/files").json()
+    folder = next(e for e in listing if e["kind"] == "dir" and e["name"] == "fastwipe")
+    assert any(
+        c["name"] == folder["id"] for c in MemoryProvider({}).list_vault_children()
+    )
+
+    resp = unlocked_client.post("/api/vault/dirs/delete", json={"path": "/fastwipe"})
+    assert resp.status_code == 200, resp.text
+    job = wait_job(unlocked_client, resp.json()["job_id"])
+    assert job["status"] == "done", job
+    assert (job.get("result") or {}).get("mode") == "fast"
+
+    root = unlocked_client.get("/api/vault/files").json()
+    assert not any(e["name"] == "fastwipe" for e in root)
+    remaining_names = {c["name"] for c in MemoryProvider({}).list_vault_children()}
+    assert folder["id"] not in remaining_names
+
+
+def test_delete_folder_per_file_when_stray_remotes(unlocked_client: TestClient) -> None:
+    """Moved-out files leave remotes behind, so folder delete uses the per_file path."""
+    upload_bytes(unlocked_client, b"keep", filename="keep.txt", path="/slowwipe")
+    upload_bytes(unlocked_client, b"move", filename="move.txt", path="/slowwipe")
+    moved = unlocked_client.post(
+        "/api/vault/move",
+        json={
+            "src_path": "/slowwipe/move.txt",
+            "dest_path": "/elsewhere/move.txt",
+            "kind": "file",
+        },
+    )
+    assert moved.status_code == 200, moved.text
+
+    resp = unlocked_client.post("/api/vault/dirs/delete", json={"path": "/slowwipe"})
+    assert resp.status_code == 200, resp.text
+    job = wait_job(unlocked_client, resp.json()["job_id"])
+    assert job["status"] == "done", job
+    assert (job.get("result") or {}).get("mode") == "per_file"
+    assert (job.get("result") or {}).get("deleted_files") == 1
+
+    root = unlocked_client.get("/api/vault/files").json()
+    assert not any(e["name"] == "slowwipe" for e in root)
+    elsewhere = unlocked_client.get("/api/vault/files", params={"path": "/elsewhere"}).json()
+    assert any(e["name"] == "move.txt" for e in elsewhere)

@@ -4,7 +4,7 @@ import time
 from typing import Any
 
 from storage import auth_context
-from storage.db import connect
+from storage.db import connect, escape_like
 
 
 def _thumb_from_row(file_row: Any) -> dict[str, Any]:
@@ -27,6 +27,10 @@ def _entry_from_rows(
     folder_rows: list[Any],
 ) -> dict[str, Any]:
     thumb = _thumb_from_row(file_row)
+    keys = file_row.keys() if hasattr(file_row, "keys") else ()
+    remote_vault_dir_id = (
+        file_row["remote_vault_dir_id"] if "remote_vault_dir_id" in keys else None
+    )
     return {
         "id": file_row["id"],
         "path": file_row["path"],
@@ -40,6 +44,7 @@ def _entry_from_rows(
         "remote_folders": {
             row["account_id"]: row["remote_folder_id"] for row in folder_rows
         },
+        "remote_vault_dir_id": remote_vault_dir_id,
         "shards": [
             {
                 "i": row["i"],
@@ -63,7 +68,7 @@ def _load_entry(conn: Any, file_id: str, user_id: str) -> dict[str, Any] | None:
         SELECT id, path, size, mtime, chunk_size, crypto_alg, wrapped_file_key,
                created_at, updated_at,
                thumb_status, thumb_account_id, thumb_remote_id, thumb_wrapped_key,
-               thumb_mime, thumb_bytes, thumb_error
+               thumb_mime, thumb_bytes, thumb_error, remote_vault_dir_id
         FROM files
         WHERE id = ? AND user_id = ?
         """,
@@ -113,6 +118,99 @@ def load_index(*, user_id: str | None = None) -> dict[str, Any]:
             if entry is not None:
                 files.append(entry)
     return {"version": 1, "files": files}
+
+
+def list_health_objects(*, user_id: str | None = None) -> dict[str, Any]:
+    """Slim checklist for shard health: shards + ready thumbnails only."""
+    uid = user_id or auth_context.require_user_id()
+    with connect() as conn:
+        file_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM files WHERE user_id = ?",
+            (uid,),
+        ).fetchone()["n"]
+        rows = conn.execute(
+            """
+            SELECT f.id AS file_id, f.path AS path, 'shard' AS kind, s.i AS i,
+                   s.account_id AS account_id, s.remote_id AS remote_id
+            FROM shards s
+            JOIN files f ON f.id = s.file_id
+            WHERE f.user_id = ?
+            UNION ALL
+            SELECT f.id AS file_id, f.path AS path, 'thumb' AS kind, NULL AS i,
+                   f.thumb_account_id AS account_id, f.thumb_remote_id AS remote_id
+            FROM files f
+            WHERE f.user_id = ?
+              AND f.thumb_status = 'ready'
+              AND f.thumb_account_id IS NOT NULL
+              AND f.thumb_remote_id IS NOT NULL
+            ORDER BY path, kind, i
+            """,
+            (uid, uid),
+        ).fetchall()
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        items.append(
+            {
+                "kind": row["kind"],
+                "file_id": row["file_id"],
+                "path": row["path"] or row["file_id"],
+                "i": None if row["i"] is None else int(row["i"]),
+                "account_id": row["account_id"],
+                "remote_id": row["remote_id"],
+            }
+        )
+    return {"file_count": int(file_count), "items": items}
+
+
+def id_path_map(*, user_id: str | None = None) -> dict[str, str]:
+    """All file id → path mappings for the user."""
+    uid = user_id or auth_context.require_user_id()
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT id, path FROM files WHERE user_id = ?",
+            (uid,),
+        ).fetchall()
+    return {str(row["id"]): str(row["path"]) for row in rows}
+
+
+def estimated_vault_bytes_by_account(
+    *, user_id: str | None = None
+) -> dict[str, int]:
+    """Estimated ciphertext bytes per account (shards + ready thumbs)."""
+    from services.capacity import estimate_shard_cipher_bytes
+
+    uid = user_id or auth_context.require_user_id()
+    totals: dict[str, int] = {}
+    with connect() as conn:
+        for row in conn.execute(
+            """
+            SELECT s.account_id AS account_id, f.size AS size, f.chunk_size AS chunk_size,
+                   s.i AS i
+            FROM shards s
+            JOIN files f ON f.id = s.file_id
+            WHERE f.user_id = ?
+            """,
+            (uid,),
+        ).fetchall():
+            aid = str(row["account_id"])
+            totals[aid] = totals.get(aid, 0) + estimate_shard_cipher_bytes(
+                int(row["size"] or 0),
+                int(row["chunk_size"] or 1),
+                int(row["i"]),
+            )
+        for row in conn.execute(
+            """
+            SELECT thumb_account_id AS account_id, COALESCE(thumb_bytes, 0) AS bytes
+            FROM files
+            WHERE user_id = ?
+              AND thumb_account_id IS NOT NULL
+              AND thumb_remote_id IS NOT NULL
+            """,
+            (uid,),
+        ).fetchall():
+            aid = str(row["account_id"])
+            totals[aid] = totals.get(aid, 0) + max(0, int(row["bytes"] or 0))
+    return totals
 
 
 def find_file(
@@ -179,6 +277,19 @@ def usage_for_account(
                 (uid, account_id),
             ).fetchall()
         ]
+        if not paths:
+            paths = [
+                row["path"]
+                for row in conn.execute(
+                    """
+                    SELECT path FROM files
+                    WHERE user_id = ? AND thumb_account_id = ? AND thumb_remote_id IS NOT NULL
+                    ORDER BY path
+                    LIMIT 5
+                    """,
+                    (uid, account_id),
+                ).fetchall()
+            ]
     shard_count = int(shard_row["n"]) if shard_row else 0
     file_count = int(shard_row["files"]) if shard_row else 0
     thumb_count = int(thumb_row["n"]) if thumb_row else 0
@@ -189,6 +300,193 @@ def usage_for_account(
         "sample_paths": paths,
         "in_use": shard_count > 0 or thumb_count > 0,
     }
+
+
+def list_objects_for_account(
+    account_id: str,
+    *,
+    user_id: str | None = None,
+) -> dict[str, Any]:
+    """Shards, thumbs, and per-file remote folders still on ``account_id``."""
+    uid = user_id or auth_context.require_user_id()
+    with connect() as conn:
+        shard_rows = conn.execute(
+            """
+            SELECT f.id AS file_id, f.path AS path, f.size AS size, f.chunk_size AS chunk_size,
+                   f.remote_vault_dir_id AS remote_vault_dir_id,
+                   s.i AS i, s.remote_id AS remote_id, s.sha256 AS sha256, s.nonce AS nonce
+            FROM shards s
+            JOIN files f ON f.id = s.file_id
+            WHERE f.user_id = ? AND s.account_id = ?
+            ORDER BY f.path, s.i
+            """,
+            (uid, account_id),
+        ).fetchall()
+        thumb_rows = conn.execute(
+            """
+            SELECT id AS file_id, path, remote_vault_dir_id,
+                   thumb_remote_id AS remote_id, thumb_wrapped_key AS wrapped_key,
+                   thumb_mime AS mime, thumb_bytes AS bytes
+            FROM files
+            WHERE user_id = ? AND thumb_account_id = ? AND thumb_remote_id IS NOT NULL
+            ORDER BY path
+            """,
+            (uid, account_id),
+        ).fetchall()
+        folder_rows = conn.execute(
+            """
+            SELECT frf.file_id AS file_id, frf.remote_folder_id AS remote_folder_id, f.path AS path
+            FROM file_remote_folders frf
+            JOIN files f ON f.id = frf.file_id
+            WHERE f.user_id = ? AND frf.account_id = ?
+            """,
+            (uid, account_id),
+        ).fetchall()
+    return {
+        "shards": [
+            {
+                "kind": "shard",
+                "file_id": row["file_id"],
+                "path": row["path"] or row["file_id"],
+                "size": int(row["size"] or 0),
+                "chunk_size": int(row["chunk_size"] or 1),
+                "remote_vault_dir_id": row["remote_vault_dir_id"],
+                "i": int(row["i"]),
+                "remote_id": row["remote_id"],
+                "sha256": row["sha256"],
+                "nonce": row["nonce"],
+            }
+            for row in shard_rows
+        ],
+        "thumbs": [
+            {
+                "kind": "thumb",
+                "file_id": row["file_id"],
+                "path": row["path"] or row["file_id"],
+                "remote_vault_dir_id": row["remote_vault_dir_id"],
+                "remote_id": row["remote_id"],
+                "wrapped_key": row["wrapped_key"],
+                "mime": row["mime"],
+                "bytes": row["bytes"],
+            }
+            for row in thumb_rows
+        ],
+        "source_folders": [
+            {
+                "file_id": row["file_id"],
+                "path": row["path"] or row["file_id"],
+                "remote_folder_id": row["remote_folder_id"],
+            }
+            for row in folder_rows
+        ],
+    }
+
+
+def update_shard_placement(
+    file_id: str,
+    shard_i: int,
+    *,
+    account_id: str,
+    remote_id: str,
+    user_id: str | None = None,
+) -> bool:
+    """Point one shard at a new account/remote. Returns False if missing."""
+    uid = user_id or auth_context.require_user_id()
+    with connect() as conn:
+        owned = conn.execute(
+            "SELECT 1 FROM files WHERE id = ? AND user_id = ?",
+            (file_id, uid),
+        ).fetchone()
+        if owned is None:
+            return False
+        cur = conn.execute(
+            """
+            UPDATE shards
+            SET account_id = ?, remote_id = ?
+            WHERE file_id = ? AND i = ?
+            """,
+            (account_id, remote_id, file_id, int(shard_i)),
+        )
+        if cur.rowcount:
+            conn.execute(
+                "UPDATE files SET updated_at = ? WHERE id = ? AND user_id = ?",
+                (int(time.time()), file_id, uid),
+            )
+        return cur.rowcount > 0
+
+
+def set_file_remote_folder(
+    file_id: str,
+    account_id: str,
+    remote_folder_id: str,
+    *,
+    user_id: str | None = None,
+) -> None:
+    uid = user_id or auth_context.require_user_id()
+    with connect() as conn:
+        owned = conn.execute(
+            "SELECT 1 FROM files WHERE id = ? AND user_id = ?",
+            (file_id, uid),
+        ).fetchone()
+        if owned is None:
+            raise FileNotFoundError("File not found")
+        conn.execute(
+            """
+            INSERT INTO file_remote_folders (file_id, account_id, remote_folder_id)
+            VALUES (?, ?, ?)
+            ON CONFLICT(file_id, account_id) DO UPDATE SET
+              remote_folder_id = excluded.remote_folder_id
+            """,
+            (file_id, account_id, remote_folder_id),
+        )
+        conn.execute(
+            "UPDATE files SET updated_at = ? WHERE id = ? AND user_id = ?",
+            (int(time.time()), file_id, uid),
+        )
+
+
+def clear_file_remote_folder(
+    file_id: str,
+    account_id: str,
+    *,
+    user_id: str | None = None,
+) -> None:
+    uid = user_id or auth_context.require_user_id()
+    with connect() as conn:
+        conn.execute(
+            """
+            DELETE FROM file_remote_folders
+            WHERE file_id = ? AND account_id = ?
+              AND EXISTS (
+                SELECT 1 FROM files WHERE id = ? AND user_id = ?
+              )
+            """,
+            (file_id, account_id, file_id, uid),
+        )
+
+
+def remote_folder_used_by_other_account(
+    remote_folder_id: str,
+    account_id: str,
+    *,
+    user_id: str | None = None,
+) -> bool:
+    """True when another account still maps a file to this remote folder id."""
+    uid = user_id or auth_context.require_user_id()
+    with connect() as conn:
+        row = conn.execute(
+            """
+            SELECT 1
+            FROM file_remote_folders frf
+            JOIN files f ON f.id = frf.file_id
+            WHERE f.user_id = ?
+              AND frf.remote_folder_id = ?
+              AND frf.account_id != ?
+            LIMIT 1
+            """,
+            (uid, remote_folder_id, account_id),
+        ).fetchone()
+    return row is not None
 
 
 def keep_refs_for_account(
@@ -234,6 +532,17 @@ def keep_refs_for_account(
         ).fetchall():
             names.add(f"thumb_{row['id']}.webp.enc")
             shard_remote_ids.add(row["thumb_remote_id"])
+        for row in conn.execute(
+            """
+            SELECT fr.remote_folder_id, f.id AS folder_row_id
+            FROM folder_remote_folders fr
+            JOIN folders f ON f.id = fr.folder_id
+            WHERE f.user_id = ? AND fr.account_id = ?
+            """,
+            (uid, account_id),
+        ).fetchall():
+            folder_ids.add(row["remote_folder_id"])
+            names.add(row["folder_row_id"])
     return {
         "names": names,
         "folder_ids": folder_ids,
@@ -285,8 +594,8 @@ def upsert_file(
               id, user_id, path, size, mtime, chunk_size, crypto_alg, wrapped_file_key,
               created_at, updated_at,
               thumb_status, thumb_account_id, thumb_remote_id, thumb_wrapped_key,
-              thumb_mime, thumb_bytes, thumb_error
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              thumb_mime, thumb_bytes, thumb_error, remote_vault_dir_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
               path = excluded.path,
               size = excluded.size,
@@ -301,7 +610,8 @@ def upsert_file(
               thumb_wrapped_key = excluded.thumb_wrapped_key,
               thumb_mime = excluded.thumb_mime,
               thumb_bytes = excluded.thumb_bytes,
-              thumb_error = excluded.thumb_error
+              thumb_error = excluded.thumb_error,
+              remote_vault_dir_id = excluded.remote_vault_dir_id
             """,
             (
                 entry["id"],
@@ -321,6 +631,7 @@ def upsert_file(
                 _thumb_col("mime", "thumb_mime"),
                 _thumb_col("bytes", "thumb_bytes"),
                 _thumb_col("error", "thumb_error"),
+                entry.get("remote_vault_dir_id"),
             ),
         )
         conn.execute("DELETE FROM shards WHERE file_id = ?", (entry["id"],))
@@ -409,10 +720,10 @@ def list_files_under_prefix(
         rows = conn.execute(
             """
             SELECT id FROM files
-            WHERE user_id = ? AND (path = ? OR path LIKE ?)
+            WHERE user_id = ? AND (path = ? OR path LIKE ? ESCAPE '\\')
             ORDER BY path
             """,
-            (uid, prefix, prefix + "/%"),
+            (uid, prefix, escape_like(prefix) + "/%"),
         ).fetchall()
         return [
             entry
@@ -508,10 +819,10 @@ def rename_files_under_prefix(
         rows = conn.execute(
             """
             SELECT id, path FROM files
-            WHERE user_id = ? AND (path = ? OR path LIKE ?)
+            WHERE user_id = ? AND (path = ? OR path LIKE ? ESCAPE '\\')
             ORDER BY length(path) DESC
             """,
-            (uid, old_prefix, old_prefix + "/%"),
+            (uid, old_prefix, escape_like(old_prefix) + "/%"),
         ).fetchall()
         updated = 0
         for row in rows:

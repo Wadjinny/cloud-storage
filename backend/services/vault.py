@@ -4,17 +4,26 @@ import hashlib
 import logging
 import os
 import queue
+import re
 import secrets
 import tempfile
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    ThreadPoolExecutor,
+    as_completed,
+    wait,
+)
+from contextvars import copy_context
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
 
 from config import (
     DATA_DIR,
+    DELETE_CONCURRENCY,
     DOWNLOAD_QUEUE_DEPTH,
     GDRIVE_ACCOUNT_DOWNLOAD_CONCURRENCY,
     GDRIVE_ACCOUNT_UPLOAD_CONCURRENCY,
@@ -30,10 +39,12 @@ from config import (
 from providers.factory import get_provider
 from services import crypto
 from services.capacity import PlacementPlanner, cipher_size
-from services.thumbnails import attach_after_upload
+from services.jobs import JobCancelled, raise_if_cancelled
+from services.thumbnails import attach_after_upload, schedule_after_upload
 from services.thumbnails.classify import classify_filename
 from storage import accounts as accounts_store
 from storage import auth_context
+from storage import folder_remotes
 from storage import folders as folders_store
 from storage import upload_sessions
 from storage import vault_index
@@ -95,6 +106,130 @@ def discard_upload_session(session_id: str) -> None:
 def list_entries(path: str = "/") -> list[dict[str, Any]]:
     index = vault_index.load_index()
     return _list_entries_clean(index, _normalize_dir(path))
+
+
+SEARCH_RESULT_LIMIT = 500
+
+
+def search_entries(
+    query: str,
+    *,
+    scope: str = "folder",
+    path: str = "/",
+    kind: str = "all",
+    regex: bool = False,
+) -> list[dict[str, Any]]:
+    """Search vault entry names (case-insensitive).
+
+    ``scope``: ``folder`` (recursive under ``path``) or ``global``.
+    ``kind``: ``all`` | ``file`` | ``dir``.
+    Matches basename only, not the full path.
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    if scope not in ("folder", "global"):
+        raise ValueError("scope must be 'folder' or 'global'")
+    if kind not in ("all", "file", "dir"):
+        raise ValueError("kind must be 'all', 'file', or 'dir'")
+
+    if regex:
+        # Common glob habit: bare "*" means "match anything".
+        pattern_src = ".*" if q == "*" else q
+        try:
+            pattern = re.compile(pattern_src, re.IGNORECASE)
+        except re.error as exc:
+            raise ValueError(f"Invalid regex: {exc}") from exc
+
+        def matches(name: str) -> bool:
+            return pattern.search(name) is not None
+    else:
+        needle = q.casefold()
+
+        def matches(name: str) -> bool:
+            return needle in name.casefold()
+
+    base = "/" if scope == "global" else _normalize_dir(path)
+    index = vault_index.load_index()
+    results: list[dict[str, Any]] = []
+
+    if kind in ("all", "dir"):
+        dirs_by_path: dict[str, dict[str, Any]] = {}
+        for folder in folders_store.list_folders_under(base):
+            dirs_by_path[folder["path"]] = {
+                "id": folder["id"],
+                "name": folder["name"],
+                "path": folder["path"],
+                "size": None,
+                "mtime": folder.get("mtime"),
+                "kind": "dir",
+                "shard_count": 0,
+            }
+        # Implied intermediate folders from file paths (not yet in folders table).
+        for entry in index.get("files", []):
+            file_path = str(entry.get("path") or "")
+            if not _path_under_base(file_path, base):
+                continue
+            parts = [p for p in PurePosixPath(file_path).parts if p != "/"]
+            for i in range(1, len(parts)):
+                dir_path = "/" + "/".join(parts[:i])
+                if not _path_under_base(dir_path, base):
+                    continue
+                if dir_path in dirs_by_path:
+                    continue
+                dirs_by_path[dir_path] = {
+                    "id": f"dir:{dir_path}",
+                    "name": parts[i - 1],
+                    "path": dir_path,
+                    "size": None,
+                    "mtime": None,
+                    "kind": "dir",
+                    "shard_count": 0,
+                }
+        for dir_path in sorted(dirs_by_path):
+            item = dirs_by_path[dir_path]
+            if matches(item["name"]):
+                results.append(item)
+                if len(results) >= SEARCH_RESULT_LIMIT:
+                    return results
+
+    if kind in ("all", "file"):
+        files: list[dict[str, Any]] = []
+        for entry in index.get("files", []):
+            file_path = str(entry.get("path") or "")
+            if not _path_under_base(file_path, base):
+                continue
+            name = PurePosixPath(file_path).name
+            if not matches(name):
+                continue
+            files.append(
+                {
+                    "id": entry["id"],
+                    "name": name,
+                    "path": file_path,
+                    "size": entry.get("size"),
+                    "mtime": entry.get("mtime"),
+                    "kind": "file",
+                    "shard_count": len(entry.get("shards", [])),
+                    "thumb_status": entry.get("thumb_status") or "none",
+                }
+            )
+        files.sort(key=lambda f: (f["name"].casefold(), f["path"]))
+        for item in files:
+            results.append(item)
+            if len(results) >= SEARCH_RESULT_LIMIT:
+                break
+
+    return results
+
+
+def _path_under_base(path: str, base: str) -> bool:
+    """True if ``path`` is ``base`` or a descendant (path form, not name match)."""
+    if base == "/":
+        return bool(path) and path.startswith("/")
+    if path == base:
+        return True
+    return path.startswith(base + "/")
 
 
 def mkdir(parent: str, name: str) -> dict[str, Any]:
@@ -251,7 +386,14 @@ def _move_folder(src_path: str, dest_path: str) -> dict[str, Any]:
 
 
 def delete_directory(path: str, on_progress: ProgressFn | None = None) -> dict[str, Any]:
-    """Recursively delete a folder: all files under it, then folder rows."""
+    """Recursively delete a folder: all files under it, then folder rows.
+
+    New uploads nest per-file remote folders under opaque vault-dir folders on
+    each provider. When every file under ``path`` was placed in that tree (no
+    legacy flat remotes, no files moved out while leaving remotes behind), delete
+    is one remote folder remove per account. Otherwise fall back to per-file
+    deletes (move leaves remotes in place by design).
+    """
     folder_path = folders_store.normalize_dir(path)
     if folder_path == "/":
         raise ValueError("Cannot delete root")
@@ -259,19 +401,146 @@ def delete_directory(path: str, on_progress: ProgressFn | None = None) -> dict[s
         raise FileNotFoundError("Folder not found")
 
     files = vault_index.list_files_under_prefix(folder_path)
-    total = max(1, len(files) + 1)
-    for i, entry in enumerate(files):
-        _progress(
-            on_progress,
-            "delete_shard",
-            i,
-            total,
-            f"Deleting {PurePosixPath(entry['path']).name}…",
+    dir_ids = set(folders_store.list_folder_ids_under(folder_path))
+    root_folder = folders_store.get_folder(folder_path)
+    root_folder_id = root_folder["id"] if root_folder else None
+    root_remotes = (
+        folder_remotes.load_for_folder(root_folder_id) if root_folder_id else {}
+    )
+
+    under_ids = {f["id"] for f in files}
+    placed = folder_remotes.list_files_placed_under(dir_ids)
+    strays = [p for p in placed if p["id"] not in under_ids]
+    legacy = [
+        f
+        for f in files
+        if not f.get("remote_vault_dir_id") and (f.get("remote_folders") or f.get("shards"))
+    ]
+    can_fast = (
+        bool(files)
+        and bool(root_remotes)
+        and not strays
+        and not legacy
+        and all(f.get("remote_vault_dir_id") in dir_ids for f in files)
+    ) or (not files and bool(root_remotes))
+
+    if can_fast and files:
+        raise_if_cancelled("Delete cancelled")
+        total = max(1, len(root_remotes) + 1)
+        _progress(on_progress, "delete_shard", 0, total, "Deleting remote folder tree…")
+        account_list = accounts_store.load_accounts()
+        providers = _providers_by_id(
+            [a for a in account_list if a["id"] in root_remotes]
         )
-        delete_file(entry["id"], on_progress=None)
+        done = 0
+        for account_id, remote_id in root_remotes.items():
+            raise_if_cancelled("Delete cancelled")
+            provider = providers.get(account_id)
+            if provider is not None:
+                try:
+                    provider.delete(remote_id)
+                except Exception:
+                    log.exception(
+                        "fast folder delete failed path=%s account=%s remote=%s",
+                        folder_path,
+                        account_id,
+                        remote_id,
+                    )
+            done += 1
+            _progress(
+                on_progress,
+                "delete_shard",
+                done,
+                total,
+                f"Deleted remote tree {done}/{len(root_remotes)}…",
+            )
+        index = vault_index.load_index()
+        for entry in files:
+            vault_index.remove_file(index, entry["id"])
+        vault_index.save_index(index)
+        folder_remotes.delete_for_folders(dir_ids)
+        folders_store.delete_folder_tree(folder_path)
+        _progress(on_progress, "done", total, total, "Done")
+        return {"path": folder_path, "deleted_files": len(files), "mode": "fast"}
+
+    total = max(1, len(files) + 1)
+    user_id = auth_context.require_user_id()
+    master_key = auth_context.require_master_key()
+    account_list = accounts_store.load_accounts()
+    needed_ids: set[str] = set()
+    for entry in files:
+        needed_ids.update(entry.get("remote_folders") or {})
+        needed_ids.update(s["account_id"] for s in entry.get("shards") or [])
+        thumb = entry.get("thumb") or {}
+        if thumb.get("account_id"):
+            needed_ids.add(thumb["account_id"])
+    providers_by_id = _providers_by_id(
+        [a for a in account_list if a["id"] in needed_ids]
+    )
+    workers = max(1, min(DELETE_CONCURRENCY, max(1, len(files))))
+    done_count = 0
+    progress_lock = threading.Lock()
+    _progress(on_progress, "delete_shard", 0, total, f"Deleting {len(files)} file(s)…")
+    raise_if_cancelled("Delete cancelled")
+
+    def _delete_one(entry: dict[str, Any]) -> None:
+        raise_if_cancelled("Delete cancelled")
+        with auth_context.auth_scope(user_id, master_key):
+            delete_file(
+                entry["id"],
+                on_progress=None,
+                providers_by_id=providers_by_id,
+                parallel_remotes=False,
+            )
+
+    pool = ThreadPoolExecutor(max_workers=workers)
+    try:
+        futures = {
+            pool.submit(copy_context().run, _delete_one, entry): entry for entry in files
+        }
+        for fut in as_completed(futures):
+            raise_if_cancelled("Delete cancelled")
+            entry = futures[fut]
+            fut.result()
+            with progress_lock:
+                done_count += 1
+                name = PurePosixPath(entry["path"]).name
+                _progress(
+                    on_progress,
+                    "delete_shard",
+                    done_count,
+                    total,
+                    f"Deleted {name} ({done_count}/{len(files)})…",
+                )
+    except JobCancelled:
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        pool.shutdown(wait=True, cancel_futures=False)
+
+    # Drop mirrored dir folders when safe (no moved-out files still using them).
+    raise_if_cancelled("Delete cancelled")
+    if root_remotes and not strays:
+        providers = _providers_by_id(
+            [a for a in account_list if a["id"] in root_remotes]
+        )
+        for account_id, remote_id in root_remotes.items():
+            provider = providers.get(account_id)
+            if provider is None:
+                continue
+            try:
+                provider.delete(remote_id)
+            except Exception:
+                log.exception(
+                    "folder remote cleanup failed path=%s account=%s remote=%s",
+                    folder_path,
+                    account_id,
+                    remote_id,
+                )
+        folder_remotes.delete_for_folders(dir_ids)
     folders_store.delete_folder_tree(folder_path)
     _progress(on_progress, "done", total, total, "Done")
-    return {"path": folder_path, "deleted_files": len(files)}
+    return {"path": folder_path, "deleted_files": len(files), "mode": "per_file"}
 
 
 def get_file_detail(file_id: str) -> dict[str, Any]:
@@ -492,12 +761,17 @@ def upload_file(
         existing["user_id"] = user_id
         existing["status"] = "active"
         existing["error"] = None
-        upload_sessions.save(existing)
     else:
         file_id = session_id or f"f_{secrets.token_hex(8)}"
         file_key = crypto.new_file_key()
         shard_records = {}
         remote_folders = {}
+
+    # Opaque vault-dir chain for nesting remotes (empty when uploading to ``/``).
+    vault_dir_ids = folders_store.folder_id_chain(_normalize_dir(dir_path))
+    remote_vault_dir_id = vault_dir_ids[-1] if vault_dir_ids else None
+
+    if existing is None:
         upload_sessions.save(
             {
                 "version": 1,
@@ -513,10 +787,16 @@ def upload_file(
                     "wrapped_file_key": crypto.wrap_file_key(master_key, file_key),
                 },
                 "remote_folders": {},
+                "remote_vault_dir_id": remote_vault_dir_id,
                 "shards": [],
                 "error": None,
             }
         )
+    else:
+        existing["remote_vault_dir_id"] = (
+            existing.get("remote_vault_dir_id") or remote_vault_dir_id
+        )
+        upload_sessions.save(existing)
 
     start_chunk = resume_from_byte // shard_size if resume_from_byte else 0
 
@@ -594,6 +874,7 @@ def upload_file(
                     "wrapped_file_key": crypto.wrap_file_key(master_key, file_key),
                 },
                 "remote_folders": folders_snapshot,
+                "remote_vault_dir_id": remote_vault_dir_id,
                 "shards": shards_snapshot,
                 "error": error,
             }
@@ -682,6 +963,23 @@ def upload_file(
                 )
         upload_sessions.delete(file_id)
 
+    def _ensure_remote_dir_parent(account_id: str) -> str | None:
+        """Ensure mirrored vault-dir folders on ``account_id``; return leaf remote id."""
+        if not vault_dir_ids:
+            return None
+        parent_remote: str | None = None
+        for vault_dir_id in vault_dir_ids:
+            cached = folder_remotes.get(vault_dir_id, account_id)
+            if cached is not None:
+                parent_remote = cached
+                continue
+            parent_remote = providers_by_id[account_id].ensure_child_folder(
+                vault_dir_id,
+                parent_id=parent_remote,
+            )
+            folder_remotes.put(vault_dir_id, account_id, parent_remote)
+        return parent_remote
+
     def _folder_for(account_id: str) -> str:
         with folders_lock:
             existing_folder = remote_folders.get(account_id)
@@ -693,7 +991,11 @@ def upload_file(
                 existing_folder = remote_folders.get(account_id)
                 if existing_folder is not None:
                     return existing_folder
-            folder_id = providers_by_id[account_id].ensure_file_folder(file_id)
+            parent_remote = _ensure_remote_dir_parent(account_id)
+            folder_id = providers_by_id[account_id].ensure_file_folder(
+                file_id,
+                parent_id=parent_remote,
+            )
             with folders_lock:
                 remote_folders[account_id] = folder_id
             _persist_session()
@@ -829,6 +1131,9 @@ def upload_file(
     # Unsupported / oversized office: skip spool.
     spool_path: Path | None = None
     spool_fp: Any = None
+    # Set once the spool is handed to the background thumbnail thread, which then
+    # owns spool cleanup so this function's finally must not unlink it.
+    thumb_scheduled = False
     thumb_kind = classify_filename(filename)
     spool_limit: int | None = None
     want_spool = False
@@ -1169,6 +1474,7 @@ def upload_file(
                 "wrapped_file_key": crypto.wrap_file_key(master_key, file_key),
             },
             "remote_folders": folders_snapshot,
+            "remote_vault_dir_id": remote_vault_dir_id,
             "shards": ordered,
         }
 
@@ -1183,19 +1489,36 @@ def upload_file(
         vault_index.save_index(index)
         upload_sessions.delete(file_id)
 
-        _progress(on_progress, "thumbnail", total_steps, total_steps, "Generating thumbnail…")
-        attach_after_upload(
-            file_id=file_id,
-            filename=filename,
-            spool_path=spool_path,
-            master_key=master_key,
-            remote_folders=folders_snapshot,
-            accounts=account_list,
-        )
-
-        refreshed = vault_index.find_file(None, file_id) or entry
-        entry["thumb_status"] = refreshed.get("thumb_status") or "none"
-        entry["thumb"] = refreshed.get("thumb")
+        # Thumbnail generation (LibreOffice/ffmpeg/Pillow) can be slow, so keep it
+        # off the upload critical path: hand the spool to a background thread and let
+        # the job complete now. The scheduled task owns spool cleanup.
+        entry["thumb_status"] = "none"
+        entry["thumb"] = None
+        if spool_path is not None:
+            schedule_after_upload(
+                user_id=user_id,
+                master_key=master_key,
+                file_id=file_id,
+                filename=filename,
+                spool_path=spool_path,
+                remote_folders=folders_snapshot,
+                accounts=account_list,
+            )
+            thumb_scheduled = True
+        else:
+            # No plaintext spool (unsupported / resume / oversized office): attach just
+            # records the final status and does no heavy work, so run it inline.
+            attach_after_upload(
+                file_id=file_id,
+                filename=filename,
+                spool_path=None,
+                master_key=master_key,
+                remote_folders=folders_snapshot,
+                accounts=account_list,
+            )
+            refreshed = vault_index.find_file(None, file_id) or entry
+            entry["thumb_status"] = refreshed.get("thumb_status") or "none"
+            entry["thumb"] = refreshed.get("thumb")
 
         _progress(on_progress, "done", total_steps, total_steps, "Done")
         log.info(
@@ -1213,7 +1536,8 @@ def upload_file(
                 spool_fp.close()
             except Exception:
                 pass
-        if spool_path is not None:
+        # When handed to the background thumbnail thread, that thread unlinks the spool.
+        if spool_path is not None and not thumb_scheduled:
             try:
                 spool_path.unlink(missing_ok=True)
             except Exception:
@@ -1547,23 +1871,19 @@ def _fetch_shard(
     return data
 
 
-def delete_file(file_id: str, on_progress: ProgressFn | None = None) -> None:
-    index = vault_index.load_index()
-    entry = vault_index.remove_file(index, file_id)
-    if entry is None:
-        raise FileNotFoundError("File not found")
-
+def _purge_file_remotes(
+    entry: dict[str, Any],
+    providers_by_id: dict[str, Any],
+    *,
+    on_progress: ProgressFn | None = None,
+    parallel: bool = True,
+) -> int:
+    """Best-effort remote cleanup for one vault file. Returns progress total_steps."""
     shard_list = entry.get("shards", [])
     remote_folders = entry.get("remote_folders") or {}
     thumb = entry.get("thumb") or {}
     thumb_account_id = thumb.get("account_id")
     thumb_remote_id = thumb.get("remote_id")
-    account_list = accounts_store.load_accounts()
-    account_map = {a["id"]: a for a in account_list}
-    needed_ids = set(remote_folders) | {s["account_id"] for s in shard_list}
-    if thumb_account_id:
-        needed_ids.add(thumb_account_id)
-    providers_by_id = _providers_by_id([a for a in account_list if a["id"] in needed_ids])
     done_count = 0
     progress_lock = threading.Lock()
 
@@ -1574,7 +1894,7 @@ def delete_file(file_id: str, on_progress: ProgressFn | None = None) -> None:
             for account_id, folder_id in remote_folders.items()
             if account_id in providers_by_id
         ]
-        total_steps = len(folder_items) + 1
+        total_steps = max(1, len(folder_items) + 1)
 
         def _delete_folder(item: tuple[str, str]) -> None:
             nonlocal done_count
@@ -1595,18 +1915,24 @@ def delete_file(file_id: str, on_progress: ProgressFn | None = None) -> None:
 
         if folder_items:
             _progress(on_progress, "delete_shard", 0, total_steps, "Deleting remote folders…")
-            with ThreadPoolExecutor(max_workers=_worker_count(len(folder_items))) as pool:
-                list(pool.map(_delete_folder, folder_items))
+            if parallel and len(folder_items) > 1:
+                with ThreadPoolExecutor(
+                    max_workers=_worker_count(len(folder_items))
+                ) as pool:
+                    list(pool.map(_delete_folder, folder_items))
+            else:
+                for item in folder_items:
+                    _delete_folder(item)
     else:
         # Legacy entries without per-file folders: delete shards one by one.
-        total_steps = len(shard_list) + 1
+        total_steps = max(1, len(shard_list) + 1)
 
         def _delete_one(shard_rec: dict[str, Any]) -> None:
             nonlocal done_count
-            account = account_map.get(shard_rec["account_id"])
-            if account is not None:
+            provider = providers_by_id.get(shard_rec["account_id"])
+            if provider is not None:
                 try:
-                    providers_by_id[account["id"]].delete(shard_rec["remote_id"])
+                    provider.delete(shard_rec["remote_id"])
                 except Exception:
                     pass
             with progress_lock:
@@ -1621,8 +1947,14 @@ def delete_file(file_id: str, on_progress: ProgressFn | None = None) -> None:
 
         if shard_list:
             _progress(on_progress, "delete_shard", 0, total_steps, "Deleting shards…")
-            with ThreadPoolExecutor(max_workers=_worker_count(len(shard_list))) as pool:
-                list(pool.map(_delete_one, shard_list))
+            if parallel and len(shard_list) > 1:
+                with ThreadPoolExecutor(
+                    max_workers=_worker_count(len(shard_list))
+                ) as pool:
+                    list(pool.map(_delete_one, shard_list))
+            else:
+                for shard_rec in shard_list:
+                    _delete_one(shard_rec)
 
     # Root-level / cross-account thumbs are not removed by per-file folder delete.
     if (
@@ -1636,6 +1968,40 @@ def delete_file(file_id: str, on_progress: ProgressFn | None = None) -> None:
         except Exception:
             pass
 
+    return total_steps
+
+
+def delete_file(
+    file_id: str,
+    on_progress: ProgressFn | None = None,
+    *,
+    providers_by_id: dict[str, Any] | None = None,
+    parallel_remotes: bool = True,
+) -> dict[str, Any]:
+    raise_if_cancelled("Delete cancelled")
+    entry = vault_index.remove_file(None, file_id)
+    if entry is None:
+        raise FileNotFoundError("File not found")
+    file_path = str(entry.get("path") or "")
+
+    if providers_by_id is None:
+        shard_list = entry.get("shards", [])
+        remote_folders = entry.get("remote_folders") or {}
+        thumb = entry.get("thumb") or {}
+        needed_ids = set(remote_folders) | {s["account_id"] for s in shard_list}
+        if thumb.get("account_id"):
+            needed_ids.add(thumb["account_id"])
+        account_list = accounts_store.load_accounts()
+        providers_by_id = _providers_by_id(
+            [a for a in account_list if a["id"] in needed_ids]
+        )
+
+    total_steps = _purge_file_remotes(
+        entry,
+        providers_by_id,
+        on_progress=on_progress,
+        parallel=parallel_remotes,
+    )
     _progress(on_progress, "index", total_steps - 1, total_steps, "Updating vault index…")
-    vault_index.save_index(index)
     _progress(on_progress, "done", total_steps, total_steps, "Done")
+    return {"id": file_id, "path": file_path}

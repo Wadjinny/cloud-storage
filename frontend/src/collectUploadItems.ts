@@ -106,17 +106,21 @@ export async function collectFromDataTransfer(
   const emptyDirs: string[] = []
   const items = dt.items ? Array.from(dt.items) : []
 
-  let usedEntries = false
+  // DataTransferItem entries are only valid synchronously during the drop event;
+  // they are neutered once we await. Grab every entry up front, THEN walk them,
+  // otherwise all but the first dropped item are lost.
+  const entries: FileSystemEntry[] = []
   for (const item of items) {
     if (item.kind !== 'file') continue
     const entry =
       typeof item.webkitGetAsEntry === 'function' ? item.webkitGetAsEntry() : null
-    if (!entry) continue
-    usedEntries = true
-    await walkEntry(entry, '', files, emptyDirs)
+    if (entry) entries.push(entry)
   }
 
-  if (usedEntries) {
+  if (entries.length > 0) {
+    for (const entry of entries) {
+      await walkEntry(entry, '', files, emptyDirs)
+    }
     return { files, emptyDirs }
   }
 

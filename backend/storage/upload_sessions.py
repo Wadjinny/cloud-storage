@@ -26,6 +26,10 @@ def _session_from_rows(
     shard_rows: list[Any],
     folder_rows: list[Any],
 ) -> dict[str, Any]:
+    keys = row.keys() if hasattr(row, "keys") else ()
+    remote_vault_dir_id = (
+        row["remote_vault_dir_id"] if "remote_vault_dir_id" in keys else None
+    )
     return {
         "version": 1,
         "id": row["id"],
@@ -42,6 +46,7 @@ def _session_from_rows(
         "remote_folders": {
             r["account_id"]: r["remote_folder_id"] for r in folder_rows
         },
+        "remote_vault_dir_id": remote_vault_dir_id,
         "shards": [
             {
                 "i": r["i"],
@@ -79,8 +84,9 @@ def save(session: dict[str, Any]) -> None:
             """
             INSERT INTO upload_sessions (
               id, user_id, status, path, filename, size, chunk_size,
-              crypto_alg, wrapped_file_key, error, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              crypto_alg, wrapped_file_key, error, remote_vault_dir_id,
+              created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
               user_id = excluded.user_id,
               status = excluded.status,
@@ -91,6 +97,7 @@ def save(session: dict[str, Any]) -> None:
               crypto_alg = excluded.crypto_alg,
               wrapped_file_key = excluded.wrapped_file_key,
               error = excluded.error,
+              remote_vault_dir_id = excluded.remote_vault_dir_id,
               updated_at = excluded.updated_at
             """,
             (
@@ -104,6 +111,7 @@ def save(session: dict[str, Any]) -> None:
                 crypto.get("alg") or "AES-256-GCM-CHUNK",
                 crypto["wrapped_file_key"],
                 session.get("error"),
+                session.get("remote_vault_dir_id"),
                 created_at,
                 now,
             ),

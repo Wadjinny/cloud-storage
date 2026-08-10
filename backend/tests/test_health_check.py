@@ -100,6 +100,31 @@ def test_health_reports_missing_shard(
         assert result["missing"][0]["i"] == 0
 
 
+def test_list_health_objects_includes_ready_thumb(
+    data_dir: Path,
+    memory_account: dict,
+) -> None:
+    account_id = memory_account["id"]
+    with _scope():
+        entry = _file_entry("f_thumb", account_id, "folder", "shard_f_thumb_0")
+        entry["thumb_status"] = "ready"
+        entry["thumb"] = {
+            "status": "ready",
+            "account_id": account_id,
+            "remote_id": "thumb_f_thumb",
+            "wrapped_key": "dGVzdA==",
+            "mime": "image/webp",
+            "bytes": 1,
+            "error": None,
+        }
+        vault_index.upsert_file(None, entry)
+        checklist = vault_index.list_health_objects()
+        kinds = {(row["kind"], row["remote_id"]) for row in checklist["items"]}
+        assert checklist["file_count"] == 1
+        assert ("shard", "shard_f_thumb_0") in kinds
+        assert ("thumb", "thumb_f_thumb") in kinds
+
+
 def test_health_api_job(
     unlocked_client: TestClient,
     data_dir: Path,

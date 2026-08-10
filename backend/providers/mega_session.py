@@ -133,23 +133,51 @@ class MegaAccountSession:
             self._folder_id = folder.id
             return self._folder_id
 
-    async def _ensure_file_folder(self, client: MegaNzClient, file_id: str) -> str:
-        """Create a per-file folder under the vault root (idempotent).
-
-        mega.py's ``create_folder`` accepts POSIX paths for lookup, but ``mkdir``
-        takes a single segment name (``/`` is illegal). So we resolve/create the
-        vault root, then mkdir ``file_id`` under that parent.
-        """
-        parent_id = await self._ensure_folder(client)
-        path = f"{SHARD_FOLDER_NAME}/{file_id}"
+    async def _ensure_child_folder(
+        self,
+        client: MegaNzClient,
+        name: str,
+        *,
+        parent_id: str | None = None,
+    ) -> str:
+        """Create/reuse folder ``name`` under ``parent_id`` or the vault root."""
+        parent = parent_id if parent_id is not None else await self._ensure_folder(client)
+        # Prefer filesystem children lookup (no full path needed under nested parents).
         try:
-            existing = await client.find(path)
-            if existing.is_folder:
-                return existing.id
-        except FileNotFoundError:
+            fs = await client.get_filesystem()
+            child_ids = getattr(fs, "children", {}).get(parent, ())
+            nodes = getattr(fs, "nodes", None)
+            if nodes is not None:
+                for child_id in child_ids:
+                    node = nodes.get(child_id)
+                    if node is None:
+                        continue
+                    if not getattr(node, "is_folder", False):
+                        continue
+                    if self._node_name(node) == name:
+                        return str(node.id)
+        except Exception:
             pass
-        folder = await client._core.mkdir(file_id, parent_id)
+        if parent_id is None:
+            path = f"{SHARD_FOLDER_NAME}/{name}"
+            try:
+                existing = await client.find(path)
+                if existing.is_folder:
+                    return existing.id
+            except FileNotFoundError:
+                pass
+        folder = await client._core.mkdir(name, parent)
         return folder.id
+
+    async def _ensure_file_folder(
+        self,
+        client: MegaNzClient,
+        file_id: str,
+        *,
+        parent_id: str | None = None,
+    ) -> str:
+        """Create a per-file folder under ``parent_id`` or the vault root."""
+        return await self._ensure_child_folder(client, file_id, parent_id=parent_id)
 
     @staticmethod
     def _node_name(node: Any) -> str:

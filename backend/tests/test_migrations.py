@@ -157,6 +157,8 @@ def test_migrate_v2_adds_timestamps(tmp_path: Path, monkeypatch: pytest.MonkeyPa
 
 
 def test_fresh_db_has_timestamp_columns(data_dir: Path) -> None:
+    from storage.db import SCHEMA_VERSION
+
     conn = sqlite3.connect(str(data_dir / "app.db"))
     conn.row_factory = sqlite3.Row
     for table in ("users", "accounts", "folders", "files"):
@@ -165,7 +167,14 @@ def test_fresh_db_has_timestamp_columns(data_dir: Path) -> None:
         assert "updated_at" in cols
     assert "created_at" in _cols(conn, "upload_sessions")
     ver = conn.execute("SELECT MAX(version) AS v FROM schema_migrations").fetchone()
-    assert int(ver["v"]) == 4
+    assert int(ver["v"]) == SCHEMA_VERSION
     assert "thumb_status" in _cols(conn, "files")
     assert "enabled" in _cols(conn, "accounts")
+    assert "activity_events" in {
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    assert "action" in _cols(conn, "activity_events")
     conn.close()

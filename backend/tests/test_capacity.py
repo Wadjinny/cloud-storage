@@ -7,6 +7,7 @@ from services.capacity import (
     PlacementPlanner,
     can_fit,
     cipher_size,
+    estimate_shard_cipher_bytes,
     headroom_bytes,
     is_full,
     reset_placement_stripes,
@@ -17,6 +18,13 @@ from services.capacity import (
 def test_cipher_size_adds_gcm_tag() -> None:
     assert cipher_size(0) == 16
     assert cipher_size(100) == 116
+
+
+def test_estimate_shard_cipher_bytes() -> None:
+    assert estimate_shard_cipher_bytes(100, 64, 0) == cipher_size(64)
+    assert estimate_shard_cipher_bytes(100, 64, 1) == cipher_size(36)
+    assert estimate_shard_cipher_bytes(0, 64, 0) == cipher_size(0)
+    assert estimate_shard_cipher_bytes(100, 64, 2) == 0
 
 
 def test_is_full_respects_ratio(monkeypatch: pytest.MonkeyPatch) -> None:

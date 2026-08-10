@@ -96,10 +96,16 @@ GDRIVE_ACCOUNT_UPLOAD_CONCURRENCY = int(
 GDRIVE_ACCOUNT_DOWNLOAD_CONCURRENCY = int(
     os.environ.get("GDRIVE_ACCOUNT_DOWNLOAD_CONCURRENCY", str(SHARD_DOWNLOAD_CONCURRENCY))
 )
+# Max parallel provider.exists calls during shard health checks (metadata only).
+HEALTH_CHECK_CONCURRENCY = int(os.environ.get("HEALTH_CHECK_CONCURRENCY", "8"))
+# Max parallel per-file deletes when folder delete cannot use the fast remote tree.
+DELETE_CONCURRENCY = int(os.environ.get("DELETE_CONCURRENCY", "8"))
 # Close idle MEGA sessions after this many seconds.
 MEGA_SESSION_TTL_SECONDS = int(os.environ.get("MEGA_SESSION_TTL_SECONDS", "600"))
 # Hard timeout for a single provider shard upload/download/delete (seconds).
 PROVIDER_OP_TIMEOUT = int(os.environ.get("PROVIDER_OP_TIMEOUT", "120"))
+# Retries for transient provider/network errors (connection reset, timeouts, …).
+PROVIDER_OP_RETRIES = int(os.environ.get("PROVIDER_OP_RETRIES", "3"))
 # Remote folder name for opaque shards on Drive / MEGA (created if missing).
 SHARD_FOLDER_NAME = os.environ.get("SHARD_FOLDER_NAME", "cloud-storage-vault")
 # Encrypted thumbnail: browser Cache-Control max-age (seconds).
@@ -113,6 +119,11 @@ THUMB_MAX_SOURCE_BYTES = int(os.environ.get("THUMB_MAX_SOURCE_BYTES", str(100 * 
 THUMB_VIDEO_SPOOL_BYTES = int(os.environ.get("THUMB_VIDEO_SPOOL_BYTES", str(32 * 1024 * 1024)))
 # Hard timeout for ffmpeg / LibreOffice / rasterize (seconds).
 THUMB_GEN_TIMEOUT = int(os.environ.get("THUMB_GEN_TIMEOUT", "60"))
+# Max plaintext size for in-browser image/PDF preview dialog (mebibytes).
+PREVIEW_MAX_MB = float(os.environ.get("PREVIEW_MAX_MB", "5"))
+PREVIEW_MAX_BYTES = max(0, int(PREVIEW_MAX_MB * 1024 * 1024))
+# How long to keep activity history rows (days). Default 30 (one month).
+HISTORY_RETENTION_DAYS = max(1, int(os.environ.get("HISTORY_RETENTION_DAYS", "30")))
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/userinfo.email",

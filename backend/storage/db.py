@@ -15,8 +15,21 @@ log = logging.getLogger(__name__)
 _lock = threading.Lock()
 _initialized = False
 
+# Backslash-escape LIKE wildcards so a literal '_' or '%' in a user path is not
+# treated as a pattern. Pair with `LIKE ? ESCAPE '\\'` in the query.
+LIKE_ESCAPE = "\\"
+
+
+def escape_like(value: str) -> str:
+    """Escape ``\\``, ``%`` and ``_`` for use as a literal in a LIKE pattern."""
+    return (
+        value.replace(LIKE_ESCAPE, LIKE_ESCAPE + LIKE_ESCAPE)
+        .replace("%", LIKE_ESCAPE + "%")
+        .replace("_", LIKE_ESCAPE + "_")
+    )
+
 # Bump when adding a migration. Fresh installs still run migrations (idempotent).
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 6
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -75,7 +88,15 @@ CREATE TABLE IF NOT EXISTS files (
   thumb_mime TEXT,
   thumb_bytes INTEGER,
   thumb_error TEXT,
+  remote_vault_dir_id TEXT,
   UNIQUE (user_id, path)
+);
+
+CREATE TABLE IF NOT EXISTS folder_remote_folders (
+  folder_id TEXT NOT NULL REFERENCES folders(id) ON DELETE CASCADE,
+  account_id TEXT NOT NULL,
+  remote_folder_id TEXT NOT NULL,
+  PRIMARY KEY (folder_id, account_id)
 );
 
 CREATE TABLE IF NOT EXISTS file_remote_folders (
@@ -106,6 +127,7 @@ CREATE TABLE IF NOT EXISTS upload_sessions (
   crypto_alg TEXT NOT NULL,
   wrapped_file_key TEXT NOT NULL,
   error TEXT,
+  remote_vault_dir_id TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
@@ -126,6 +148,22 @@ CREATE TABLE IF NOT EXISTS upload_session_shards (
   nonce TEXT NOT NULL,
   PRIMARY KEY (session_id, i)
 );
+
+CREATE TABLE IF NOT EXISTS activity_events (
+  id TEXT PRIMARY KEY,
+  user_id TEXT,
+  action TEXT NOT NULL,
+  status TEXT NOT NULL,
+  path TEXT,
+  detail TEXT,
+  meta_json TEXT,
+  created_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_activity_user_created
+  ON activity_events(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_activity_created
+  ON activity_events(created_at);
 """
 
 
@@ -276,10 +314,58 @@ def _migrate_v4_account_enabled(conn: sqlite3.Connection) -> None:
     conn.execute("UPDATE accounts SET enabled = 1 WHERE enabled IS NULL")
 
 
+def _migrate_v5_folder_remotes(conn: sqlite3.Connection) -> None:
+    """Opaque vault-dir folders on providers + placement dir on files/sessions."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS folder_remote_folders (
+          folder_id TEXT NOT NULL REFERENCES folders(id) ON DELETE CASCADE,
+          account_id TEXT NOT NULL,
+          remote_folder_id TEXT NOT NULL,
+          PRIMARY KEY (folder_id, account_id)
+        )
+        """
+    )
+    _add_column_if_missing(conn, "files", "remote_vault_dir_id", "TEXT")
+    _add_column_if_missing(conn, "upload_sessions", "remote_vault_dir_id", "TEXT")
+
+
+def _migrate_v6_activity_events(conn: sqlite3.Connection) -> None:
+    """Per-user activity history (upload/download/delete/auth/accounts)."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS activity_events (
+          id TEXT PRIMARY KEY,
+          user_id TEXT,
+          action TEXT NOT NULL,
+          status TEXT NOT NULL,
+          path TEXT,
+          detail TEXT,
+          meta_json TEXT,
+          created_at INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_activity_user_created
+          ON activity_events(user_id, created_at DESC)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_activity_created
+          ON activity_events(created_at)
+        """
+    )
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     2: _migrate_v2_timestamps,
     3: _migrate_v3_thumbnails,
     4: _migrate_v4_account_enabled,
+    5: _migrate_v5_folder_remotes,
+    6: _migrate_v6_activity_events,
 }
 
 

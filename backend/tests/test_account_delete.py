@@ -58,7 +58,11 @@ def test_cannot_delete_account_with_shards(
 
     res = unlocked_client.delete(f"/api/accounts/{account_id}")
     assert res.status_code == 409
-    assert "shard" in res.json()["detail"].lower()
+    detail = res.json()["detail"]
+    assert isinstance(detail, dict)
+    assert detail["code"] == "account_in_use"
+    assert detail["shard_count"] >= 1
+    assert "shard" in detail["message"].lower()
 
     listed = unlocked_client.get("/api/accounts")
     assert listed.status_code == 200
