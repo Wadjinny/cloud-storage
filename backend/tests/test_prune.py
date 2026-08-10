@@ -65,7 +65,7 @@ def test_prune_deletes_orphans_keeps_indexed(
 ) -> None:
     MemoryProvider.reset()
     account_id = memory_account["id"]
-    provider = MemoryProvider({})
+    provider = MemoryProvider({}, account_id=account_id)
 
     with _scope():
         kept_folder = provider.ensure_file_folder("f_kept")
@@ -95,7 +95,7 @@ def test_prune_discards_abandoned_active_and_failed(
     """Active sessions with no live upload pipeline are abandoned garbage."""
     MemoryProvider.reset()
     account_id = memory_account["id"]
-    provider = MemoryProvider({})
+    provider = MemoryProvider({}, account_id=account_id)
 
     with _scope():
         abandoned_folder = provider.ensure_file_folder("f_abandoned")
@@ -164,7 +164,7 @@ def test_prune_keeps_live_upload_session(
 ) -> None:
     MemoryProvider.reset()
     account_id = memory_account["id"]
-    provider = MemoryProvider({})
+    provider = MemoryProvider({}, account_id=account_id)
 
     with _scope():
         live_folder = provider.ensure_file_folder("f_live")
@@ -207,7 +207,7 @@ def test_analyze_all_reports_orphans_without_deleting(
 ) -> None:
     MemoryProvider.reset()
     account_id = memory_account["id"]
-    provider = MemoryProvider({})
+    provider = MemoryProvider({}, account_id=account_id)
 
     with _scope():
         kept_folder = provider.ensure_file_folder("f_kept")
@@ -236,7 +236,7 @@ def test_prune_orphan_includes_vault_path(
 ) -> None:
     MemoryProvider.reset()
     account_id = memory_account["id"]
-    provider = MemoryProvider({})
+    provider = MemoryProvider({}, account_id=account_id)
 
     with _scope():
         from storage import folders as folders_store
@@ -261,7 +261,8 @@ def test_prune_api_analyze_then_apply(
     memory_account: dict,
 ) -> None:
     MemoryProvider.reset()
-    provider = MemoryProvider({})
+    account_id = memory_account["id"]
+    provider = MemoryProvider({}, account_id=account_id)
     provider.ensure_file_folder("f_api_orphan")
 
     analyze = unlocked_client.post("/api/accounts/prune/analyze")

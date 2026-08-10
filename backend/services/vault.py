@@ -36,10 +36,12 @@ from config import (
     THUMB_VIDEO_SPOOL_BYTES,
     choose_chunk_size,
 )
+from providers.errors import ProviderError, provider_error_from_download
 from providers.factory import get_provider
 from services import crypto
 from services.capacity import PlacementPlanner, cipher_size
 from services.jobs import JobCancelled, raise_if_cancelled
+from services.remote_dirs import ensure_remote_dir_parent
 from services.thumbnails import attach_after_upload, schedule_after_upload
 from services.thumbnails.classify import classify_filename
 from storage import accounts as accounts_store
@@ -150,7 +152,9 @@ def search_entries(
             return needle in name.casefold()
 
     base = "/" if scope == "global" else _normalize_dir(path)
-    index = vault_index.load_index()
+    # Slim rows only (path/meta + shard count). Avoid load_index(), which pulls
+    # every shard row and makes search laggy on large vaults.
+    file_rows = vault_index.list_search_rows()
     results: list[dict[str, Any]] = []
 
     if kind in ("all", "dir"):
@@ -166,7 +170,7 @@ def search_entries(
                 "shard_count": 0,
             }
         # Implied intermediate folders from file paths (not yet in folders table).
-        for entry in index.get("files", []):
+        for entry in file_rows:
             file_path = str(entry.get("path") or "")
             if not _path_under_base(file_path, base):
                 continue
@@ -195,7 +199,7 @@ def search_entries(
 
     if kind in ("all", "file"):
         files: list[dict[str, Any]] = []
-        for entry in index.get("files", []):
+        for entry in file_rows:
             file_path = str(entry.get("path") or "")
             if not _path_under_base(file_path, base):
                 continue
@@ -210,7 +214,7 @@ def search_entries(
                     "size": entry.get("size"),
                     "mtime": entry.get("mtime"),
                     "kind": "file",
-                    "shard_count": len(entry.get("shards", [])),
+                    "shard_count": int(entry.get("shard_count") or 0),
                     "thumb_status": entry.get("thumb_status") or "none",
                 }
             )
@@ -296,7 +300,12 @@ def _dest_occupied(path: str, *, moving_prefix: str | None = None) -> str | None
 
 
 def move_entry(*, src_path: str, dest_path: str, kind: str | None = None) -> dict[str, Any]:
-    """Move/rename a file or folder (DB path rewrite; remote shards unchanged)."""
+    """Move/rename a file or folder.
+
+    Folder moves and same-parent renames are DB-only. Moving a file to a new
+    parent relocates each per-file remote folder with provider ``move_item``
+    before the path rewrite.
+    """
     src_raw = src_path.rstrip("/") if src_path != "/" else src_path
     file_entry = vault_index.find_file_by_path(src_raw)
     folder_path = folders_store.normalize_dir(src_path)
@@ -322,13 +331,27 @@ def _move_file(entry: dict[str, Any], dest_path: str) -> dict[str, Any]:
     if not dest.startswith("/"):
         dest = "/" + dest
     folders_store.validate_name(PurePosixPath(dest).name)
+    src_parent = folders_store.normalize_dir(str(PurePosixPath(entry["path"]).parent))
     parent = folders_store.normalize_dir(str(PurePosixPath(dest).parent))
     if parent != "/":
         folders_store.ensure_folder(parent)
     occupied = _dest_occupied(dest)
     if occupied:
         raise ValueError(f"A {occupied} already exists at the destination")
-    updated = vault_index.rename_file_path(entry["id"], dest)
+
+    vault_dir_ids = folders_store.folder_id_chain(parent)
+    new_remote_vault_dir_id = vault_dir_ids[-1] if vault_dir_ids else None
+    parent_changed = src_parent != parent
+
+    if parent_changed and (entry.get("remote_folders") or {}):
+        _relocate_file_remotes(entry, parent)
+
+    updated = vault_index.rename_file_path(
+        entry["id"],
+        dest,
+        remote_vault_dir_id=new_remote_vault_dir_id,
+        set_remote_vault_dir=parent_changed,
+    )
     assert updated is not None
     return {
         "id": updated["id"],
@@ -339,6 +362,21 @@ def _move_file(entry: dict[str, Any], dest_path: str) -> dict[str, Any]:
         "mtime": updated.get("mtime"),
         "shard_count": len(updated.get("shards") or []),
     }
+
+
+def _relocate_file_remotes(entry: dict[str, Any], dest_parent: str) -> None:
+    """Provider-native move of each per-file remote folder into dest vault-dir."""
+    remote_folders = dict(entry.get("remote_folders") or {})
+    if not remote_folders:
+        return
+    for account_id, remote_folder_id in remote_folders.items():
+        account = accounts_store.get_account(account_id)
+        if account is None:
+            raise ValueError(f"Account {account_id} not found for relocate")
+        provider = get_provider(account)
+        dest_remote = ensure_remote_dir_parent(dest_parent, account_id, provider)
+        parent_id = dest_remote if dest_remote is not None else provider.vault_root()
+        provider.move_item(remote_folder_id, parent_id=parent_id)
 
 
 def _move_folder(src_path: str, dest_path: str) -> dict[str, Any]:
@@ -390,9 +428,9 @@ def delete_directory(path: str, on_progress: ProgressFn | None = None) -> dict[s
 
     New uploads nest per-file remote folders under opaque vault-dir folders on
     each provider. When every file under ``path`` was placed in that tree (no
-    legacy flat remotes, no files moved out while leaving remotes behind), delete
-    is one remote folder remove per account. Otherwise fall back to per-file
-    deletes (move leaves remotes in place by design).
+    legacy flat remotes, no files still pointing at these vault-dir ids after a
+    move-out), delete is one remote folder remove per account. Otherwise fall
+    back to per-file deletes.
     """
     folder_path = folders_store.normalize_dir(path)
     if folder_path == "/":
@@ -417,14 +455,13 @@ def delete_directory(path: str, on_progress: ProgressFn | None = None) -> dict[s
         if not f.get("remote_vault_dir_id") and (f.get("remote_folders") or f.get("shards"))
     ]
     can_fast = (
-        bool(files)
-        and bool(root_remotes)
+        bool(root_remotes)
         and not strays
         and not legacy
         and all(f.get("remote_vault_dir_id") in dir_ids for f in files)
-    ) or (not files and bool(root_remotes))
+    )
 
-    if can_fast and files:
+    if can_fast:
         raise_if_cancelled("Delete cancelled")
         total = max(1, len(root_remotes) + 1)
         _progress(on_progress, "delete_shard", 0, total, "Deleting remote folder tree…")
@@ -1864,10 +1901,19 @@ def _fetch_shard(
     account = account_map.get(shard_rec["account_id"])
     if account is None:
         raise RuntimeError(f"Missing account for shard {shard_rec['i']}")
-    data = providers_by_id[account["id"]].download(shard_rec["remote_id"])
+    try:
+        data = providers_by_id[account["id"]].download(shard_rec["remote_id"])
+    except Exception as exc:
+        raise provider_error_from_download(exc, account) from exc
     digest = hashlib.sha256(data).hexdigest()
     if digest != shard_rec["sha256"]:
-        raise RuntimeError(f"Shard {shard_rec['i']} hash mismatch")
+        label = account.get("label") or account["id"]
+        raise ProviderError(
+            f"Shard {shard_rec['i']} hash mismatch on account {label}",
+            provider=str(account["provider"]) if account.get("provider") else None,
+            account_id=account["id"],
+            account_label=str(label),
+        )
     return data
 
 

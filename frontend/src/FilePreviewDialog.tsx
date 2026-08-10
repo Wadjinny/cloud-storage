@@ -1,11 +1,16 @@
+/* @refresh reload */
 import { useEffect, useEffectEvent, useRef, useState } from 'react'
 import { fetchVaultFileBlob, type VaultEntry } from './api/vault'
+import { iconKindForEntry } from './fileIconKinds'
 import {
   DEFAULT_PREVIEW_MAX_BYTES,
+  DEFAULT_VIDEO_PREVIEW_MAX_BYTES,
   formatPreviewLimit,
+  isBrowserVideoName,
   mimeForFilename,
   type PreviewOpenKind,
 } from './filePreview'
+import { DownloadIcon, PreviewIcon } from './uiIcons'
 
 type CacheEntry = {
   promise: Promise<string>
@@ -19,11 +24,22 @@ function formatBytes(n: number | null | undefined): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MiB`
 }
 
+function limitForEntry(
+  entry: VaultEntry,
+  maxBytes: number,
+  videoMaxBytes: number,
+): number {
+  const kind = iconKindForEntry(entry)
+  if (kind === 'video' || isBrowserVideoName(entry.name)) return videoMaxBytes
+  return maxBytes
+}
+
 export function FilePreviewDialog({
   entry,
   kind,
   imagePeers,
   maxBytes = DEFAULT_PREVIEW_MAX_BYTES,
+  videoMaxBytes = DEFAULT_VIDEO_PREVIEW_MAX_BYTES,
   onClose,
   onDownload,
   onChangeEntry,
@@ -32,6 +48,7 @@ export function FilePreviewDialog({
   kind: PreviewOpenKind
   imagePeers: VaultEntry[]
   maxBytes?: number
+  videoMaxBytes?: number
   onClose: () => void
   onDownload: (entry: VaultEntry) => void
   onChangeEntry: (entry: VaultEntry) => void
@@ -137,15 +154,19 @@ export function FilePreviewDialog({
   }, [kind, hasPrev, hasNext, imageIndex, imagePeers, onChangeEntry, onClose])
 
   if (kind === 'download') {
+    const limitBytes = limitForEntry(entry, maxBytes, videoMaxBytes)
     return (
       <div className="modal-backdrop" onClick={onClose}>
         <div className="modal" onClick={(e) => e.stopPropagation()}>
-          <div className="modal-header">Download file</div>
+          <div className="modal-header">
+            <DownloadIcon />
+            Download file
+          </div>
           <div className="modal-body">
             <div className="preview-download-msg">
               <span className="data">{entry.name}</span> cannot be previewed
-              {entry.size != null && entry.size > maxBytes
-                ? ` (larger than ${formatPreviewLimit(maxBytes)})`
+              {entry.size != null && entry.size > limitBytes
+                ? ` (larger than ${formatPreviewLimit(limitBytes)})`
                 : ''}
               .
             </div>
@@ -183,6 +204,7 @@ export function FilePreviewDialog({
         aria-label={`Preview ${entry.name}`}
       >
         <div className="modal-header preview-header">
+          <PreviewIcon />
           <span className="preview-title data" title={entry.name}>
             {entry.name}
           </span>
@@ -229,6 +251,13 @@ export function FilePreviewDialog({
               <img src={objectUrl} alt={entry.name} className="preview-img" />
             ) : objectUrl && kind === 'pdf' ? (
               <iframe title={entry.name} src={objectUrl} className="preview-pdf" />
+            ) : objectUrl && kind === 'video' ? (
+              <video
+                controls
+                playsInline
+                src={objectUrl}
+                className="preview-video"
+              />
             ) : null}
           </div>
           {kind === 'image' && hasNext ? (

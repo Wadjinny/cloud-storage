@@ -171,6 +171,40 @@ class MegaProvider:
 
         session.run(_delete)
 
+    def vault_root(self) -> str:
+        session = self._session()
+
+        async def _root(client: MegaNzClient) -> str:
+            return await session._ensure_folder(client)
+
+        return session.run(_root)
+
+    def move_item(self, remote_id: str, *, parent_id: str) -> None:
+        def _once() -> None:
+            session = self._session()
+
+            async def _move(client: MegaNzClient) -> None:
+                await client.move(remote_id, parent_id)
+
+            session.run(_move)
+
+        def _on_retry(_exc: BaseException, _attempt: int) -> None:
+            mega_sessions.drop(self._email)
+
+        call_with_retries(
+            _once,
+            op=f"mega move id={remote_id}",
+            attempts=PROVIDER_OP_RETRIES,
+            on_retry=_on_retry,
+        )
+        with self._fs_lock:
+            self._fs_cache = None
+
+    def copy_item(self, remote_id: str, *, parent_id: str, name: str) -> str:
+        """MEGA SDK has no native copy; duplicate ciphertext via download+upload."""
+        data = self.download(remote_id)
+        return self.upload(name, data, parent_id=parent_id)
+
     def quota(self) -> dict[str, int | None]:
         session = self._session()
 

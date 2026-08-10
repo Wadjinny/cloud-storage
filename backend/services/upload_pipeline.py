@@ -388,11 +388,13 @@ class UploadPipelineHub:
         if err:
             raise RuntimeError(err)
 
-    def abort(self, job_id: str, message: str = "Upload cancelled") -> None:
+    def abort(self, job_id: str, message: str = "Upload cancelled") -> str | None:
+        """Cancel one pipeline. Returns its session_id when known (for cleanup)."""
         pipeline = self.get(job_id)
         if pipeline is None:
             jobs.request_cancel(job_id, message)
-            return
+            return None
+        session_id = pipeline.session_id
         log.info("upload abort job_id=%s message=%s", job_id, message)
         pipeline.cancel_requested.set()
         pipeline.error = message
@@ -404,6 +406,22 @@ class UploadPipelineHub:
             if not pipeline.done.is_set():
                 pipeline.done.set()
         self._drop(job_id)
+        return session_id
+
+    def abort_all_for_user(
+        self, user_id: str, message: str = "Upload cancelled"
+    ) -> list[str]:
+        """Cancel every live upload for ``user_id``. Returns session ids to discard."""
+        with self._lock:
+            job_ids = [
+                p.job_id for p in self._pipelines.values() if p.user_id == user_id
+            ]
+        session_ids: list[str] = []
+        for job_id in job_ids:
+            sid = self.abort(job_id, message)
+            if sid:
+                session_ids.append(sid)
+        return session_ids
 
 
 upload_pipelines = UploadPipelineHub()

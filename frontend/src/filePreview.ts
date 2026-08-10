@@ -4,6 +4,9 @@ import { iconKindForEntry } from './fileIconKinds'
 /** Fallback when status has not loaded yet (matches backend default). */
 export const DEFAULT_PREVIEW_MAX_BYTES = 5 * 1024 * 1024
 
+/** Fallback when status has not loaded yet (matches backend default). */
+export const DEFAULT_VIDEO_PREVIEW_MAX_BYTES = 100 * 1024 * 1024
+
 const BROWSER_IMAGE_EXT = new Set([
   '.jpg',
   '.jpeg',
@@ -12,6 +15,9 @@ const BROWSER_IMAGE_EXT = new Set([
   '.webp',
   '.bmp',
 ])
+
+/** Formats browsers can usually play via a video element without plugins. */
+const BROWSER_VIDEO_EXT = new Set(['.mp4', '.webm', '.m4v'])
 
 function extOf(name: string): string {
   const i = name.lastIndexOf('.')
@@ -24,6 +30,10 @@ export function isBrowserImageName(name: string): boolean {
 
 export function isPdfName(name: string): boolean {
   return extOf(name) === '.pdf'
+}
+
+export function isBrowserVideoName(name: string): boolean {
+  return BROWSER_VIDEO_EXT.has(extOf(name))
 }
 
 export function mimeForFilename(name: string): string {
@@ -42,17 +52,23 @@ export function mimeForFilename(name: string): string {
       return 'image/bmp'
     case '.pdf':
       return 'application/pdf'
+    case '.mp4':
+    case '.m4v':
+      return 'video/mp4'
+    case '.webm':
+      return 'video/webm'
     default:
       return 'application/octet-stream'
   }
 }
 
-export type PreviewOpenKind = 'image' | 'pdf' | 'download'
+export type PreviewOpenKind = 'image' | 'pdf' | 'video' | 'download'
 
 /** Decide how double-click should open this entry. */
 export function previewOpenKind(
   entry: VaultEntry,
   maxBytes: number = DEFAULT_PREVIEW_MAX_BYTES,
+  videoMaxBytes: number = DEFAULT_VIDEO_PREVIEW_MAX_BYTES,
 ): PreviewOpenKind | null {
   if (entry.kind !== 'file') return null
   const size = entry.size
@@ -63,6 +79,12 @@ export function previewOpenKind(
   }
   if (kind === 'pdf' || isPdfName(entry.name)) {
     if (size != null && size <= maxBytes) return 'pdf'
+    return 'download'
+  }
+  if (kind === 'video') {
+    if (isBrowserVideoName(entry.name) && size != null && size <= videoMaxBytes) {
+      return 'video'
+    }
     return 'download'
   }
   return 'download'

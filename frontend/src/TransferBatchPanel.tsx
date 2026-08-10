@@ -2,7 +2,8 @@ import type { TransferFileStatus, TransferTreeNode } from './transferTree'
 
 const STATUS_FLAGS: Record<TransferFileStatus, { label: string; glyph: string }> = {
   done: { label: 'done', glyph: '✓' },
-  current: { label: 'uploading', glyph: '●' },
+  current: { label: 'current', glyph: '●' },
+  prefetch: { label: 'prefetch', glyph: '◌' },
   error: { label: 'error', glyph: '!' },
   queued: { label: 'queued', glyph: '○' },
 }
@@ -67,6 +68,10 @@ export function TransferBatchPanel({
   const currents = Object.entries(statuses)
     .filter(([, s]) => s === 'current')
     .map(([path]) => path)
+  const prefetching = Object.entries(statuses)
+    .filter(([, s]) => s === 'prefetch')
+    .map(([path]) => path)
+  const active = currents.length + prefetching.length
 
   return (
     <div className="transfer-batch-panel" role="dialog" aria-label="Transfer queue">
@@ -76,7 +81,7 @@ export function TransferBatchPanel({
         </div>
         <span className="transfer-batch-count">
           {done}/{total}
-          {currents.length > 1 ? ` · ${currents.length} active` : ''}
+          {active > 1 ? ` · ${active} active` : ''}
         </span>
         <button
           type="button"
@@ -94,6 +99,15 @@ export function TransferBatchPanel({
           <span className="transfer-file">{currents[0]}</span>
         </div>
       ) : null}
+      {prefetching.length > 0 ? (
+        <div className="transfer-batch-prefetch" title={prefetching.join(', ')}>
+          <span className="transfer-batch-flag prefetch">◌</span>
+          <span className="transfer-file">
+            Prefetching {prefetching.length}: {prefetching[0]}
+            {prefetching.length > 1 ? ` +${prefetching.length - 1}` : ''}
+          </span>
+        </div>
+      ) : null}
       <div className="transfer-batch-body">
         {tree.length === 0 ? (
           <div className="empty-hint">No files</div>
@@ -108,6 +122,11 @@ export function TransferBatchPanel({
         <span>
           <span className="transfer-batch-flag current">●</span> current
         </span>
+        {kind === 'download' ? (
+          <span>
+            <span className="transfer-batch-flag prefetch">◌</span> prefetch
+          </span>
+        ) : null}
         <span>
           <span className="transfer-batch-flag queued">○</span> queued
         </span>

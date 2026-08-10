@@ -29,6 +29,18 @@ class StorageProvider(Protocol):
         """Delete a shard or a per-file folder (folder delete removes children)."""
         ...
 
+    def vault_root(self) -> str:
+        """Remote folder id of the opaque vault root (``SHARD_FOLDER_NAME``)."""
+        ...
+
+    def move_item(self, remote_id: str, *, parent_id: str) -> None:
+        """Reparent ``remote_id`` under ``parent_id`` (provider-native when possible)."""
+        ...
+
+    def copy_item(self, remote_id: str, *, parent_id: str, name: str) -> str:
+        """Duplicate ``remote_id`` under ``parent_id`` as ``name``; return new remote id."""
+        ...
+
     def quota(self) -> dict[str, int | None]:
         """Return {used, total} in bytes when known."""
         ...

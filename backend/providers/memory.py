@@ -20,17 +20,27 @@ class MemoryProvider:
     # Large enough that 1 GiB uploads stay under STORAGE_FULL_RATIO headroom.
     _total = 8 * 1024 * 1024 * 1024
 
-    def __init__(self, credentials: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self,
+        credentials: dict[str, Any] | None = None,
+        *,
+        account_id: str | None = None,
+    ) -> None:
         creds = credentials or {}
         self._used_override = creds.get("used")
         self._total_override = creds.get("total")
         root = creds.get("disk_root")
         self._disk_root = Path(root) if root else None
         self._unlink_after_read = bool(creds.get("unlink_after_read"))
+        # Per-account roots so evacuate can delete the source vault folder without
+        # wiping another memory account that shares the process-wide store.
+        self._root_id = (
+            f"{self.VAULT_ROOT_ID}_{account_id}" if account_id else self.VAULT_ROOT_ID
+        )
         if self._disk_root is not None:
             self._disk_root.mkdir(parents=True, exist_ok=True)
         with self._lock:
-            self._folders.setdefault(self.VAULT_ROOT_ID, set())
+            self._folders.setdefault(self._root_id, set())
 
     @classmethod
     def reset(cls) -> None:
@@ -42,7 +52,7 @@ class MemoryProvider:
             cls._folders.setdefault(cls.VAULT_ROOT_ID, set())
 
     def ensure_child_folder(self, name: str, *, parent_id: str | None = None) -> str:
-        parent = parent_id if parent_id is not None else self.VAULT_ROOT_ID
+        parent = parent_id if parent_id is not None else self._root_id
         folder_id = f"dir_{parent}_{name}"
         with self._lock:
             # Reuse existing child with the same display name under parent.
@@ -59,7 +69,7 @@ class MemoryProvider:
 
     def list_vault_children(self) -> list[dict[str, str]]:
         with self._lock:
-            child_ids = list(self._folders.get(self.VAULT_ROOT_ID, set()))
+            child_ids = list(self._folders.get(self._root_id, set()))
             out: list[dict[str, str]] = []
             for child_id in child_ids:
                 if child_id in self._folders:
@@ -160,6 +170,34 @@ class MemoryProvider:
                 self._used -= len(prev)
             for folder_children in self._folders.values():
                 folder_children.discard(remote_id)
+
+    def vault_root(self) -> str:
+        with self._lock:
+            self._folders.setdefault(self._root_id, set())
+        return self._root_id
+
+    def move_item(self, remote_id: str, *, parent_id: str) -> None:
+        if not self.exists(remote_id):
+            raise FileNotFoundError(f"Missing remote {remote_id}")
+        with self._lock:
+            for children in self._folders.values():
+                children.discard(remote_id)
+            self._folders.setdefault(parent_id, set()).add(remote_id)
+
+    def copy_item(self, remote_id: str, *, parent_id: str, name: str) -> str:
+        with self._lock:
+            is_folder = remote_id in self._folders
+            child_ids = list(self._folders.get(remote_id, set())) if is_folder else []
+            child_names = {
+                child: self._folder_names.get(child, child) for child in child_ids
+            }
+        if is_folder:
+            new_id = self.ensure_child_folder(name, parent_id=parent_id)
+            for child in child_ids:
+                self.copy_item(child, parent_id=new_id, name=child_names[child])
+            return new_id
+        data = self.download(remote_id)
+        return self.upload(name, data, parent_id=parent_id)
 
     def quota(self) -> dict[str, int | None]:
         used = self._used_override if self._used_override is not None else self._used

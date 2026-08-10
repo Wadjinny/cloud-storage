@@ -1,6 +1,6 @@
 import { normalizeRel } from './collectUploadItems'
 
-export type TransferFileStatus = 'queued' | 'current' | 'done' | 'error'
+export type TransferFileStatus = 'queued' | 'current' | 'prefetch' | 'done' | 'error'
 
 export type TransferTreeNode = {
   name: string

@@ -64,6 +64,12 @@ def test_evacuate_moves_shards_and_deletes_account(
     assert all(s["account_id"] == dest_id for s in detail["shards"])
     assert download_bytes(unlocked_client, file_id) == b"evacuate-me"
 
+    # Source vault root (cloud-storage-vault) must be gone; dest root remains.
+    source_root = f"{MemoryProvider.VAULT_ROOT_ID}_{source_id}"
+    dest_root = f"{MemoryProvider.VAULT_ROOT_ID}_{dest_id}"
+    assert source_root not in MemoryProvider._folders
+    assert dest_root in MemoryProvider._folders
+
 
 def test_evacuate_fails_without_destination(
     unlocked_client: TestClient,
@@ -143,6 +149,7 @@ def test_evacuate_cancel_then_retry(
     body = wait_job(unlocked_client, job_id)
     assert body["cancel_requested"] is True
     assert body["status"] == "error"
+    assert "cancel" in (body.get("error") or "").lower()
 
     accounts = unlocked_client.get("/api/accounts").json()
     assert any(a["id"] == source_id for a in accounts)

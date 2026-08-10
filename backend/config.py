@@ -68,6 +68,13 @@ SHARD_DOWNLOAD_CONCURRENCY = int(os.environ.get("SHARD_DOWNLOAD_CONCURRENCY", "1
 UPLOAD_QUEUE_DEPTH = int(os.environ.get("UPLOAD_QUEUE_DEPTH", "0"))
 # Max decrypted/encrypted shard buffers during streaming download.
 DOWNLOAD_QUEUE_DEPTH = int(os.environ.get("DOWNLOAD_QUEUE_DEPTH", "4"))
+# How many zip members may download/decrypt at once (1 = current file only).
+# Extra slots prefetch the next files while the current one is written into the zip.
+ZIP_PREFETCH_FILES = max(1, int(os.environ.get("ZIP_PREFETCH_FILES", "3")))
+# Do not whole-file-prefetch members larger than this (stream them when reached).
+ZIP_PREFETCH_MAX_FILE_BYTES = int(
+    os.environ.get("ZIP_PREFETCH_MAX_FILE_BYTES", str(32 * 1024 * 1024))
+)
 # Treat an account as full at this usage ratio (0.8 or 80 both mean 80%).
 _raw_full = os.environ.get("STORAGE_FULL_RATIO", "0.8").strip()
 STORAGE_FULL_RATIO = float(_raw_full)
@@ -122,6 +129,9 @@ THUMB_GEN_TIMEOUT = int(os.environ.get("THUMB_GEN_TIMEOUT", "60"))
 # Max plaintext size for in-browser image/PDF preview dialog (mebibytes).
 PREVIEW_MAX_MB = float(os.environ.get("PREVIEW_MAX_MB", "5"))
 PREVIEW_MAX_BYTES = max(0, int(PREVIEW_MAX_MB * 1024 * 1024))
+# Max plaintext size for in-browser video preview dialog (mebibytes).
+VIDEO_PREVIEW_MAX_MB = float(os.environ.get("VIDEO_PREVIEW_MAX_MB", "100"))
+VIDEO_PREVIEW_MAX_BYTES = max(0, int(VIDEO_PREVIEW_MAX_MB * 1024 * 1024))
 # How long to keep activity history rows (days). Default 30 (one month).
 HISTORY_RETENTION_DAYS = max(1, int(os.environ.get("HISTORY_RETENTION_DAYS", "30")))
 GOOGLE_SCOPES = [

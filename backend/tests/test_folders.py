@@ -108,8 +108,8 @@ def test_delete_folder_uses_fast_remote_tree(unlocked_client: TestClient) -> Non
     assert folder["id"] not in remaining_names
 
 
-def test_delete_folder_per_file_when_stray_remotes(unlocked_client: TestClient) -> None:
-    """Moved-out files leave remotes behind, so folder delete uses the per_file path."""
+def test_delete_folder_fast_after_file_move_out(unlocked_client: TestClient) -> None:
+    """File move relocates remotes, so source folder delete can use the fast path."""
     upload_bytes(unlocked_client, b"keep", filename="keep.txt", path="/slowwipe")
     upload_bytes(unlocked_client, b"move", filename="move.txt", path="/slowwipe")
     moved = unlocked_client.post(
@@ -126,7 +126,7 @@ def test_delete_folder_per_file_when_stray_remotes(unlocked_client: TestClient) 
     assert resp.status_code == 200, resp.text
     job = wait_job(unlocked_client, resp.json()["job_id"])
     assert job["status"] == "done", job
-    assert (job.get("result") or {}).get("mode") == "per_file"
+    assert (job.get("result") or {}).get("mode") == "fast"
     assert (job.get("result") or {}).get("deleted_files") == 1
 
     root = unlocked_client.get("/api/vault/files").json()

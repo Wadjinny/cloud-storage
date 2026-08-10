@@ -243,7 +243,11 @@ export async function evacuateAccount(
       (err instanceof TransferJobError && err.job.cancel_requested)
     ) {
       await cancelJob(jobId)
-      throw new Error('Evacuate cancelled')
+      const detail =
+        err instanceof TransferJobError && err.job.error
+          ? err.job.error
+          : 'Evacuate cancelled'
+      throw new Error(detail)
     }
     throw err
   } finally {

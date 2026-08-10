@@ -17,6 +17,8 @@ export type VaultStatus = {
   shard_upload_concurrency?: number
   /** Max file size (bytes) for in-browser image/PDF preview. */
   preview_max_bytes?: number
+  /** Max file size (bytes) for in-browser video preview. */
+  video_preview_max_bytes?: number
 }
 
 export type ThumbStatus = 'none' | 'ready' | 'failed' | 'unsupported' | string
@@ -128,6 +130,14 @@ export type ProgressUpdate = {
   message: string
   phase: string
   stats?: UploadJobStats | null
+  current?: number
+  total?: number
+  /** 0-based index of the file currently packing into a zip download. */
+  zipFileIndex?: number
+  zipFileTotal?: number
+  zipArcname?: string
+  /** Arcnames downloading ahead of the file currently written into the zip. */
+  zipPrefetching?: string[]
 }
 
 async function readError(res: Response): Promise<string> {
@@ -178,6 +188,28 @@ export async function moveVaultEntry(
   })
   if (!res.ok) throw new Error(await readError(res))
   return res.json() as Promise<VaultEntry>
+}
+
+export async function copyVaultEntry(
+  srcPath: string,
+  destPath: string,
+  kind?: 'file' | 'dir',
+  onProgress?: (update: ProgressUpdate) => void,
+  opts?: { signal?: AbortSignal },
+): Promise<void> {
+  const signal = opts?.signal
+  onProgress?.({ percent: 0, message: 'Starting copy…', phase: 'queued' })
+  const res = await fetch(apiUrl('/api/vault/copy'), {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ src_path: srcPath, dest_path: destPath, kind }),
+    signal,
+  })
+  if (!res.ok) throw new Error(await readError(res))
+  const { job_id: jobId } = (await res.json()) as { job_id: string }
+  if (signal?.aborted) throw new Error('Copy cancelled')
+  await waitForCancelableJob(jobId, 'Copy cancelled', onProgress, signal)
 }
 
 export async function deleteVaultDir(
@@ -286,12 +318,37 @@ export async function waitForJob(
         if (!dataLine) continue
         const job = JSON.parse(dataLine.slice(6)) as TransferJob
         last = job
-        onProgress?.({
-          percent: job.percent,
-          message: job.message,
-          phase: job.phase,
-          stats: job.stats ?? null,
-        })
+        const stats = job.stats as
+          | (UploadJobStats & {
+              zip_file_index?: number
+              zip_file_total?: number
+              zip_arcname?: string
+              zip_prefetching?: string[]
+            })
+          | null
+          | undefined
+        try {
+          onProgress?.({
+            percent: job.percent,
+            message: job.message,
+            phase: job.phase,
+            stats: stats ?? null,
+            current: job.current,
+            total: job.total,
+            zipFileIndex:
+              typeof stats?.zip_file_index === 'number' ? stats.zip_file_index : undefined,
+            zipFileTotal:
+              typeof stats?.zip_file_total === 'number' ? stats.zip_file_total : undefined,
+            zipArcname:
+              typeof stats?.zip_arcname === 'string' ? stats.zip_arcname : undefined,
+            zipPrefetching: Array.isArray(stats?.zip_prefetching)
+              ? stats.zip_prefetching.filter((n): n is string => typeof n === 'string')
+              : undefined,
+          })
+        } catch (err) {
+          // UI progress handlers must not abort an in-flight transfer.
+          console.error('waitForJob onProgress failed', err)
+        }
         if (job.status === 'done') return job
         if (job.status === 'error') throw new TransferJobError(job)
       }
@@ -312,6 +369,18 @@ export async function waitForJob(
 export async function cancelUploadJob(jobId: string): Promise<void> {
   try {
     await fetch(apiUrl(`/api/vault/upload/${encodeURIComponent(jobId)}/cancel`), {
+      method: 'POST',
+      credentials: 'include',
+    })
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Abort every in-flight upload pipeline for this session (batch cancel). */
+export async function cancelAllUploadJobs(): Promise<void> {
+  try {
+    await fetch(apiUrl('/api/vault/upload/cancel-all'), {
       method: 'POST',
       credentials: 'include',
     })
@@ -400,6 +469,14 @@ async function runUploadAttempt(
     void cancelUploadJob(jobId)
   }
   signal?.addEventListener('abort', onAbort)
+  // If Cancel already fired (cancel-all before AbortController.abort), stop the
+  // server pipeline before tearing down PUT/SSE so ClientDisconnect cannot
+  // finish() queued shards.
+  if (signal?.aborted) {
+    await cancelUploadJob(jobId)
+    signal.removeEventListener('abort', onAbort)
+    throw new Error('Upload cancelled')
+  }
   // Start PUT before SSE so body upload wins the browser connection pool when
   // several files run in parallel (SSE-first filled all 6 slots and deadlocked).
   const putPromise = putUploadBody(jobId, body, signal)
@@ -504,28 +581,69 @@ async function runDownloadStreamJob(
 
   try {
     if (dir) {
+      let streamErr: unknown = null
       try {
         const streamRes = await fetch(streamUrl, { credentials: 'include', signal })
         if (!streamRes.ok) throw new Error(await readError(streamRes))
         if (!streamRes.body) throw new Error('Download stream unavailable')
         await writeToDownloadFolder(dir, saveName, streamRes.body, signal)
       } catch (err) {
-        await cancelDownloadJob(jobId)
         if (
           (err instanceof DOMException && err.name === 'AbortError') ||
           (err instanceof Error && err.message === 'Download cancelled') ||
           signal?.aborted
         ) {
+          await cancelDownloadJob(jobId)
           throw new Error('Download cancelled')
         }
+        streamErr = err
+      }
+      if (streamErr) {
+        // Prefer job.error (account + reason). Only cancel if the job never settles.
+        const settled = await Promise.race([
+          events.then(
+            (job) => ({ type: 'done' as const, job }),
+            (err) => ({ type: 'error' as const, err }),
+          ),
+          new Promise<{ type: 'timeout' }>((resolve) =>
+            setTimeout(() => resolve({ type: 'timeout' }), 2000),
+          ),
+        ])
+        if (settled.type === 'error') {
+          if (
+            signal?.aborted ||
+            (settled.err instanceof TransferJobError && settled.err.job.cancel_requested)
+          ) {
+            throw new Error('Download cancelled')
+          }
+          throw settled.err
+        }
+        if (settled.type === 'done') throw streamErr
+        await cancelDownloadJob(jobId)
         try {
           await events
-        } catch {
-          /* prefer stream error */
+        } catch (jobErr) {
+          if (
+            jobErr instanceof TransferJobError &&
+            !jobErr.job.cancel_requested &&
+            jobErr.job.error
+          ) {
+            throw jobErr
+          }
         }
-        throw err
+        throw streamErr
       }
-      await events
+      try {
+        await events
+      } catch (jobErr) {
+        if (
+          signal?.aborted ||
+          (jobErr instanceof TransferJobError && jobErr.job.cancel_requested)
+        ) {
+          throw new Error('Download cancelled')
+        }
+        throw jobErr
+      }
       return
     }
 
@@ -621,14 +739,40 @@ export async function fetchVaultFileBlob(
   signal?.addEventListener('abort', onAbort)
   const events = waitForJob(jobId, undefined, signal)
   try {
-    const streamRes = await fetch(streamUrl, { credentials: 'include', signal })
-    if (!streamRes.ok) throw new Error(await readError(streamRes))
-    const raw = await streamRes.blob()
-    const blob =
-      opts?.mime && raw.type !== opts.mime
-        ? new Blob([raw], { type: opts.mime })
-        : raw
-    await events
+    let streamErr: unknown = null
+    let blob: Blob | null = null
+    try {
+      const streamRes = await fetch(streamUrl, { credentials: 'include', signal })
+      if (!streamRes.ok) throw new Error(await readError(streamRes))
+      const raw = await streamRes.blob()
+      blob =
+        opts?.mime && raw.type !== opts.mime
+          ? new Blob([raw], { type: opts.mime })
+          : raw
+    } catch (err) {
+      if (
+        (err instanceof DOMException && err.name === 'AbortError') ||
+        (err instanceof Error && err.message === 'Download cancelled') ||
+        signal?.aborted
+      ) {
+        await cancelDownloadJob(jobId)
+        throw new Error('Download cancelled')
+      }
+      streamErr = err
+    }
+    try {
+      await events
+    } catch (jobErr) {
+      if (
+        signal?.aborted ||
+        (jobErr instanceof TransferJobError && jobErr.job.cancel_requested)
+      ) {
+        throw new Error('Download cancelled')
+      }
+      throw jobErr
+    }
+    if (streamErr) throw streamErr
+    if (!blob) throw new Error('Download stream unavailable')
     return { blob, filename }
   } catch (err) {
     if (signal?.aborted || (err instanceof Error && err.message === 'Download cancelled')) {
@@ -647,10 +791,21 @@ export type ZipDownloadItem = {
   id?: string
 }
 
+export type ZipDownloadResolved = {
+  filename: string
+  fileCount: number
+  files: string[]
+  emptyDirs: string[]
+}
+
 export async function downloadVaultZip(
   items: ZipDownloadItem[],
   onProgress?: (update: ProgressUpdate) => void,
-  opts?: { signal?: AbortSignal; directory?: FileSystemDirectoryHandle | null },
+  opts?: {
+    signal?: AbortSignal
+    directory?: FileSystemDirectoryHandle | null
+    onResolved?: (info: ZipDownloadResolved) => void
+  },
 ): Promise<void> {
   const signal = opts?.signal
   onProgress?.({ percent: 0, message: 'Starting zip download…', phase: 'queued' })
@@ -674,7 +829,17 @@ export async function downloadVaultZip(
     job_id: string
     filename?: string
     file_count?: number
+    files?: string[]
+    empty_dirs?: string[]
   }
+  const files = Array.isArray(started.files) ? started.files : []
+  const emptyDirs = Array.isArray(started.empty_dirs) ? started.empty_dirs : []
+  opts?.onResolved?.({
+    filename: started.filename || 'vault.zip',
+    fileCount: started.file_count ?? files.length,
+    files,
+    emptyDirs,
+  })
   await runDownloadStreamJob(started.job_id, started.filename || 'vault.zip', onProgress, {
     signal,
     directory: directory ?? null,

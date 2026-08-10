@@ -1,6 +1,10 @@
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
-  useDeferredValue,
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query'
+import {
   useEffect,
   useMemo,
   useRef,
@@ -30,6 +34,7 @@ import {
   type PruneAnalyzeResult,
 } from '../api/accounts'
 import {
+  copyVaultEntry,
   deleteVaultDir,
   deleteVaultFile,
   downloadVaultFile,
@@ -70,10 +75,15 @@ import {
   getDownloadFolderName,
   supportsDownloadFolder,
 } from '../downloadFolder'
+import {
+  FileContextMenu,
+  type FileContextMenuState,
+} from '../FileContextMenu'
 import { FilePreviewDialog } from '../FilePreviewDialog'
 import { FileThumb } from '../FileThumb'
 import {
   DEFAULT_PREVIEW_MAX_BYTES,
+  DEFAULT_VIDEO_PREVIEW_MAX_BYTES,
   previewableImagesInFolder,
   previewOpenKind,
   type PreviewOpenKind,
@@ -85,6 +95,19 @@ import {
   type TransferKind,
   type TransferState,
 } from '../TransferContext'
+import {
+  AccountsIcon,
+  ConflictIcon,
+  EvacuateIcon,
+  FolderIcon,
+  HealthIcon,
+  InspectIcon,
+  MegaIcon,
+  PruneIcon,
+  RenameIcon,
+  SignInIcon,
+  VaultIcon,
+} from '../uiIcons'
 import {
   buildTransferTree,
   initialFileStatuses,
@@ -176,6 +199,58 @@ function pathParts(path: string): string[] {
   return path.replace(/^\//, '').split('/').filter(Boolean)
 }
 
+type CrumbItem =
+  | { kind: 'part'; index: number; name: string }
+  | { kind: 'ellipsis' }
+
+/** Collapse deep trails: first + … + last two (unless expanded). */
+function buildCrumbItems(parts: string[], expanded: boolean): CrumbItem[] {
+  if (expanded || parts.length <= 3) {
+    return parts.map((name, index) => ({ kind: 'part', index, name }))
+  }
+  const items: CrumbItem[] = [{ kind: 'part', index: 0, name: parts[0] }]
+  items.push({ kind: 'ellipsis' })
+  for (let i = parts.length - 2; i < parts.length; i++) {
+    items.push({ kind: 'part', index: i, name: parts[i] })
+  }
+  return items
+}
+
+function VaultRootIcon() {
+  return (
+    <svg width={12} height={12} viewBox="0 0 14 14" aria-hidden className="btn-icon-svg">
+      <path
+        d="M2 4.5h4l1 1.25H12v5.25a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V4.5z"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinejoin="round"
+      />
+    </svg>
+  )
+}
+
+function CrumbChevron() {
+  return (
+    <svg
+      width={10}
+      height={10}
+      viewBox="0 0 10 10"
+      aria-hidden
+      className="crumb-chevron"
+    >
+      <path
+        d="M3.5 2L6.5 5 3.5 8"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.3"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  )
+}
+
 function rateFromSamples(samples: RateSample[]): AccountRate | null {
   if (samples.length < 2) return null
   const first = samples[0]
@@ -225,16 +300,18 @@ function applyTransferRates(
   | 'activeShards'
 > {
   const now = Date.now()
+  // Zip packing (and some job phases) omit shard breakdowns; keep the bar alive.
+  const rows = Array.isArray(stats.by_account) ? stats.by_account : []
   overallRef.current = pushSample(
     overallRef.current,
-    stats.done_shards,
-    stats.done_bytes,
+    stats.done_shards ?? 0,
+    stats.done_bytes ?? 0,
     now,
   )
   const overallRate = rateFromSamples(overallRef.current)
 
   const accountRates: Record<string, AccountRate> = {}
-  for (const row of stats.by_account) {
+  for (const row of rows) {
     const next = pushSample(byAccount.get(row.account_id) ?? [], row.shards, row.bytes, now)
     byAccount.set(row.account_id, next)
     const rate = rateFromSamples(next)
@@ -243,7 +320,7 @@ function applyTransferRates(
 
   const activeShards =
     stats.active_shards ??
-    stats.by_account.reduce((sum, row) => sum + (row.active ?? 0), 0)
+    rows.reduce((sum, row) => sum + (row.active ?? 0), 0)
 
   return {
     doneBytes: stats.done_bytes,
@@ -253,7 +330,7 @@ function applyTransferRates(
     activeShards,
     shardsPerSec: overallRate?.shardsPerSec ?? null,
     mbPerSec: overallRate?.mbPerSec ?? null,
-    byAccount: stats.by_account,
+    byAccount: rows,
     accountRates,
   }
 }
@@ -303,6 +380,7 @@ export default function Workspace() {
     transfer,
     setTransfer,
     setBatchQueue,
+    setUploadActive,
     uploadAbortRef,
     downloadAbortRef,
     jobAbortRef,
@@ -312,11 +390,17 @@ export default function Workspace() {
   const [selectedIds, setSelectedIds] = useState<string[]>([])
   const [anchorId, setAnchorId] = useState<string | null>(null)
   const [searchInput, setSearchInput] = useState('')
+  const [debouncedSearch, setDebouncedSearch] = useState('')
   const [searchScope, setSearchScope] = useState<VaultSearchScope>('folder')
   const [searchKind, setSearchKind] = useState<VaultSearchKind>('all')
   const [searchRegex, setSearchRegex] = useState(false)
-  const deferredSearch = useDeferredValue(searchInput.trim())
-  const searchActive = deferredSearch.length > 0
+  useEffect(() => {
+    const handle = window.setTimeout(() => {
+      setDebouncedSearch(searchInput.trim())
+    }, 250)
+    return () => window.clearTimeout(handle)
+  }, [searchInput])
+  const searchActive = debouncedSearch.length > 0
   const pendingSelectRef = useRef<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [megaOpen, setMegaOpen] = useState(false)
@@ -342,6 +426,10 @@ export default function Workspace() {
     kind: PreviewOpenKind
   } | null>(null)
   const [dropTarget, setDropTarget] = useState<string | null>(null)
+  const [clipboard, setClipboard] = useState<
+    { path: string; kind: 'file' | 'dir'; name: string }[] | null
+  >(null)
+  const [ctxMenu, setCtxMenu] = useState<FileContextMenuState | null>(null)
   const [pruneOpen, setPruneOpen] = useState(false)
   const [pruneReport, setPruneReport] = useState<PruneAnalyzeResult | null>(null)
   const [pruneAnalyzing, setPruneAnalyzing] = useState(false)
@@ -478,6 +566,27 @@ export default function Workspace() {
     })
   }
 
+  function markBatchZipProgress(
+    labels: string[],
+    index: number,
+    prefetching: string[] = [],
+  ) {
+    const prefetch = new Set(prefetching)
+    setBatchQueue((prev) => {
+      if (!prev) return prev
+      const statuses = { ...prev.statuses }
+      for (let i = 0; i < labels.length; i++) {
+        const label = labels[i]
+        if (statuses[label] === 'error') continue
+        if (i < index) statuses[label] = 'done'
+        else if (i === index) statuses[label] = 'current'
+        else if (prefetch.has(label)) statuses[label] = 'prefetch'
+        else statuses[label] = 'queued'
+      }
+      return { ...prev, statuses }
+    })
+  }
+
   const statusQuery = useQuery({
     queryKey: ['vault', 'status'],
     queryFn: getVaultStatus,
@@ -512,21 +621,32 @@ export default function Workspace() {
   })
 
   const searchQuery = useQuery({
-    queryKey: ['vault', 'search', deferredSearch, searchScope, path, searchKind, searchRegex],
+    queryKey: [
+      'vault',
+      'search',
+      debouncedSearch,
+      searchScope,
+      path,
+      searchKind,
+      searchRegex,
+    ],
     queryFn: () =>
       searchVaultFiles({
-        q: deferredSearch,
+        q: debouncedSearch,
         scope: searchScope,
         path,
         kind: searchKind,
         regex: searchRegex,
       }),
     enabled: unlocked && searchActive,
+    placeholderData: keepPreviousData,
     // Don't spin on 404/400 (e.g. stale backend without /search, or bad regex).
     retry: false,
   })
 
   const entries = searchActive ? searchQuery.data?.results : filesQuery.data
+  // Avoid firing dozens of thumbnail fetches while typing through big result sets.
+  const searchSkipThumbs = searchActive && (entries?.length ?? 0) > 48
   const selectedEntries = useMemo(() => {
     if (!entries) return []
     const byId = new Map(entries.map((e) => [e.id, e]))
@@ -577,6 +697,15 @@ export default function Workspace() {
   }, [filesQuery.data, searchActive, path])
 
   const crumbs = useMemo(() => pathParts(path), [path])
+  const [crumbsExpanded, setCrumbsExpanded] = useState(false)
+  useEffect(() => {
+    setCrumbsExpanded(false)
+    setCtxMenu(null)
+  }, [path])
+  const crumbItems = useMemo(
+    () => buildCrumbItems(crumbs, crumbsExpanded),
+    [crumbs, crumbsExpanded],
+  )
 
   const loginMut = useMutation({
     mutationFn: () => login(username, passphrase),
@@ -640,8 +769,12 @@ export default function Workspace() {
       const ac = new AbortController()
       jobAbortRef.current = ac
       try {
-        return await withTransfer('evacuate', 'Moving account data…', (onProgress) =>
-          evacuateAccount(accountId, onProgress, { signal: ac.signal }),
+        return await withTransfer(
+          'evacuate',
+          'Moving account data…',
+          (onProgress) =>
+            evacuateAccount(accountId, onProgress, { signal: ac.signal }),
+          { trackRates: true },
         )
       } finally {
         jobAbortRef.current = null
@@ -656,12 +789,33 @@ export default function Workspace() {
       await qc.invalidateQueries({ queryKey: ['vault'] })
       await qc.invalidateQueries({ queryKey: ['vault', 'status'] })
     },
-    onError: (e: Error) => {
-      if (e.message === 'Evacuate cancelled') {
-        setError(null)
+    onError: async (e: Error) => {
+      const msg = e.message || ''
+      const cancelled =
+        msg === 'Evacuate cancelled' || msg.startsWith('Evacuate cancelled after')
+      if (cancelled) {
+        // Keep the dialog open so the user can resume; refresh usage counts.
+        setError(msg.startsWith('Evacuate cancelled after') ? msg : null)
+        await qc.invalidateQueries({ queryKey: ['accounts'] })
+        await qc.invalidateQueries({ queryKey: ['accounts', 'storage'] })
+        await qc.invalidateQueries({ queryKey: ['vault'] })
+        if (evacuateDetail) {
+          try {
+            const accounts = await qc.fetchQuery({
+              queryKey: ['accounts'],
+              queryFn: listAccounts,
+            })
+            if (!accounts.some((a) => a.id === evacuateDetail.account_id)) {
+              setEvacuateOpen(false)
+              setEvacuateDetail(null)
+            }
+          } catch {
+            /* ignore */
+          }
+        }
         return
       }
-      setError(e.message)
+      setError(msg)
     },
   })
 
@@ -679,13 +833,30 @@ export default function Workspace() {
     kind: TransferKind,
     startMessage: string,
     apiFn: (onProgress: (u: ProgressUpdate) => void) => Promise<T>,
+    opts?: { trackRates?: boolean },
   ): Promise<T> {
     setTransfer({ kind, percent: 0, message: startMessage })
+    if (opts?.trackRates) resetTransferRates()
     try {
-      return await apiFn((u) =>
-        setTransfer({ kind, percent: u.percent, message: u.message }),
-      )
+      return await apiFn((u) => {
+        const base: TransferState = {
+          kind,
+          percent: u.percent,
+          message: u.message,
+        }
+        if (opts?.trackRates && u.stats) {
+          const rates = applyTransferRates(
+            u.stats,
+            transferRateSamplesRef,
+            transferAccountRateSamplesRef.current,
+          )
+          setTransfer({ ...base, ...rates })
+          return
+        }
+        setTransfer(base)
+      })
     } finally {
+      if (opts?.trackRates) resetTransferRates()
       setTransfer(null)
     }
   }
@@ -813,6 +984,7 @@ export default function Workspace() {
       }
       const ac = new AbortController()
       uploadAbortRef.current = ac
+      setUploadActive(true)
       resetTransferRates()
       uploadFilePercentsRef.current = new Map()
       const labels = files.map((f) => f.relativePath)
@@ -899,6 +1071,7 @@ export default function Workspace() {
         })
       } finally {
         uploadAbortRef.current = null
+        setUploadActive(false)
         resetTransferRates()
         uploadFilePercentsRef.current = new Map()
       }
@@ -1011,9 +1184,9 @@ export default function Workspace() {
       }
       const onlyOneFile =
         entries.length === 1 && entries[0].kind === 'file'
-      startBatchQueue('download', labels)
       try {
         if (onlyOneFile) {
+          startBatchQueue('download', labels)
           const entry = entries[0]
           markBatchCurrent(labels, 0)
           setTransfer({
@@ -1042,15 +1215,16 @@ export default function Workspace() {
           return
         }
 
-        // Multi-select or any folder: one streaming ZIP, paths relative to common base.
-        markBatchCurrent(labels, 0)
+        // Multi-select or any folder: one streaming ZIP; batch list expands to members.
+        let memberLabels: string[] = []
+        let zipName = 'archive.zip'
         setTransfer({
           kind: 'download',
           percent: 0,
           message: 'Starting zip…',
           itemLabel: labels.join(', '),
           itemIndex: 0,
-          itemTotal: 1,
+          itemTotal: 0,
         })
         try {
           await downloadVaultZip(
@@ -1059,15 +1233,70 @@ export default function Workspace() {
                 ? { kind: 'dir' as const, path: e.path }
                 : { kind: 'file' as const, path: e.path, id: e.id },
             ),
-            (u) =>
-              onShardTransferProgress('download', 0, 1, u, {
-                itemLabel: 'archive.zip',
-              }),
-            { signal: ac.signal, directory },
+            (u) => {
+              const fileTotal = Math.max(
+                u.zipFileTotal ?? memberLabels.length,
+                1,
+              )
+              const fileIndex = Math.min(
+                Math.max(u.zipFileIndex ?? 0, 0),
+                fileTotal - 1,
+              )
+              if (memberLabels.length > 0) {
+                markBatchZipProgress(
+                  memberLabels,
+                  fileIndex,
+                  u.zipPrefetching ?? [],
+                )
+              }
+              // Backend zip progress is already overall (byte-weighted). Do not
+              // re-scale with batchProgress or the bar stays near 0%.
+              const base: TransferState = {
+                kind: 'download',
+                percent: u.percent,
+                message: u.message,
+                itemLabel: u.zipArcname || zipName,
+                itemIndex: fileIndex,
+                itemTotal: fileTotal,
+              }
+              if (!u.stats) {
+                setTransfer(base)
+                return
+              }
+              const rates = applyTransferRates(
+                u.stats,
+                transferRateSamplesRef,
+                transferAccountRateSamplesRef.current,
+              )
+              setTransfer({ ...base, ...rates })
+            },
+            {
+              signal: ac.signal,
+              directory,
+              onResolved: (info) => {
+                zipName = info.filename
+                memberLabels = info.files
+                startBatchQueue('download', info.files, info.emptyDirs)
+                if (info.files.length > 0) markBatchCurrent(info.files, 0)
+                setTransfer({
+                  kind: 'download',
+                  percent: 0,
+                  message: `Packing ${info.fileCount} file(s) into ${info.filename}…`,
+                  itemLabel: info.files[0] || info.filename,
+                  itemIndex: 0,
+                  itemTotal: Math.max(info.fileCount, 1),
+                })
+              },
+            },
           )
-          for (const label of labels) setBatchFileStatus(label, 'done')
+          for (const label of memberLabels) setBatchFileStatus(label, 'done')
         } catch (err) {
-          for (const label of labels) setBatchFileStatus(label, 'error')
+          if (memberLabels.length > 0) {
+            for (const label of memberLabels) setBatchFileStatus(label, 'error')
+          } else {
+            startBatchQueue('download', labels)
+            for (const label of labels) setBatchFileStatus(label, 'error')
+          }
           throw err
         }
       } finally {
@@ -1196,6 +1425,52 @@ export default function Workspace() {
     },
   })
 
+  const copyMut = useMutation({
+    mutationFn: async (
+      items: { src: string; destDir: string; kind: 'file' | 'dir' }[],
+    ) => {
+      const ac = new AbortController()
+      jobAbortRef.current = ac
+      try {
+        for (let i = 0; i < items.length; i++) {
+          if (ac.signal.aborted) throw new Error('Copy cancelled')
+          const item = items[i]
+          const name = item.src.split('/').filter(Boolean).pop() || ''
+          const dest = item.destDir === '/' ? `/${name}` : `${item.destDir}/${name}`
+          const onProg = (u: ProgressUpdate) => {
+            const mapped = batchProgress(i, items.length, u)
+            setTransfer({ kind: 'copy', ...mapped })
+          }
+          await copyVaultEntry(item.src, dest, item.kind, onProg, {
+            signal: ac.signal,
+          })
+        }
+      } finally {
+        jobAbortRef.current = null
+      }
+    },
+    onSuccess: async () => {
+      setTransfer(null)
+      setDropTarget(null)
+      setSelectedIds([])
+      setError(null)
+      await qc.invalidateQueries({ queryKey: ['vault'] })
+      await qc.invalidateQueries({ queryKey: ['accounts', 'storage'] })
+    },
+    onError: async (e: Error) => {
+      setTransfer(null)
+      setDropTarget(null)
+      if (e.message === 'Copy cancelled') {
+        setError(null)
+        await qc.invalidateQueries({ queryKey: ['vault'] })
+        await qc.invalidateQueries({ queryKey: ['accounts', 'storage'] })
+        return
+      }
+      setError(e.message)
+      await qc.invalidateQueries({ queryKey: ['vault'] })
+    },
+  })
+
   const busy =
     uploadMut.isPending ||
     downloadMut.isPending ||
@@ -1203,7 +1478,66 @@ export default function Workspace() {
     mkdirMut.isPending ||
     renameMut.isPending ||
     moveMut.isPending ||
+    copyMut.isPending ||
     uploadConflictBusy
+
+  useEffect(() => {
+    if (!unlocked) return
+    const onKey = (e: KeyboardEvent) => {
+      const t = e.target
+      if (
+        t instanceof HTMLInputElement ||
+        t instanceof HTMLTextAreaElement ||
+        (t instanceof HTMLElement && t.isContentEditable)
+      ) {
+        return
+      }
+      if (mkdirOpen || renameOpen || filePreview) return
+      const mod = e.metaKey || e.ctrlKey
+      if (mod && e.key === 'c') {
+        if (selectedEntries.length === 0) return
+        e.preventDefault()
+        setClipboard(
+          selectedEntries.map((entry) => ({
+            path: entry.path,
+            kind: entry.kind,
+            name: entry.name,
+          })),
+        )
+        return
+      }
+      if (mod && e.key === 'v') {
+        if (!clipboard?.length || busy) return
+        e.preventDefault()
+        let target = path
+        if (
+          selectedEntries.length === 1 &&
+          selectedEntries[0].kind === 'dir'
+        ) {
+          target = selectedEntries[0].path
+        }
+        copyMut.mutate(
+          clipboard.map((item) => ({
+            src: item.path,
+            destDir: target,
+            kind: item.kind,
+          })),
+        )
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [
+    unlocked,
+    selectedEntries,
+    clipboard,
+    busy,
+    mkdirOpen,
+    renameOpen,
+    filePreview,
+    path,
+    copyMut,
+  ])
 
   const accountsOpBusy =
     accountsLocked ||
@@ -1242,6 +1576,8 @@ export default function Workspace() {
 
   const previewMaxBytes =
     statusQuery.data?.preview_max_bytes ?? DEFAULT_PREVIEW_MAX_BYTES
+  const videoPreviewMaxBytes =
+    statusQuery.data?.video_preview_max_bytes ?? DEFAULT_VIDEO_PREVIEW_MAX_BYTES
 
   function parentDirOf(entryPath: string): string {
     const i = entryPath.lastIndexOf('/')
@@ -1264,7 +1600,7 @@ export default function Workspace() {
       setPath(entry.path)
       return
     }
-    const kind = previewOpenKind(entry, previewMaxBytes)
+    const kind = previewOpenKind(entry, previewMaxBytes, videoPreviewMaxBytes)
     if (!kind) return
     setFilePreview({ entry, kind })
   }
@@ -1340,11 +1676,39 @@ export default function Workspace() {
     })
   }
 
-  function startRename() {
-    const entry = selectedEntries[0]
-    if (!entry) return
-    setRenameValue(entry.name)
+  function startRename(entry?: VaultEntry) {
+    const target = entry ?? selectedEntries[0]
+    if (!target) return
+    setSelectedIds([target.id])
+    setAnchorId(target.id)
+    setRenameValue(target.name)
     setRenameOpen(true)
+  }
+
+  function confirmDeleteEntries(entries: VaultEntry[]) {
+    if (entries.length === 0) return
+    const dirs = entries.filter((e) => e.kind === 'dir').length
+    const msg =
+      dirs > 0
+        ? `Delete ${entries.length} item(s), including ${dirs} folder(s) and their contents?`
+        : null
+    if (msg && !window.confirm(msg)) return
+    deleteFileMut.mutate(entries)
+  }
+
+  function openEntryContextMenu(entry: VaultEntry, e: MouseEvent) {
+    e.preventDefault()
+    e.stopPropagation()
+    const targets = selectedIds.includes(entry.id)
+      ? selectedEntries.length > 0
+        ? selectedEntries
+        : [entry]
+      : [entry]
+    if (!selectedIds.includes(entry.id)) {
+      setSelectedIds([entry.id])
+      setAnchorId(entry.id)
+    }
+    setCtxMenu({ x: e.clientX, y: e.clientY, targets })
   }
 
   function onDragStartEntry(entry: VaultEntry, e: DragEvent) {
@@ -1352,7 +1716,33 @@ export default function Workspace() {
     const raw = JSON.stringify(payload)
     e.dataTransfer.setData('application/x-vault-entry', raw)
     e.dataTransfer.setData('text/plain', raw)
-    e.dataTransfer.effectAllowed = 'move'
+    e.dataTransfer.effectAllowed = 'copyMove'
+  }
+
+  function copySelectionToClipboard() {
+    if (selectedEntries.length === 0) return
+    setClipboard(
+      selectedEntries.map((e) => ({ path: e.path, kind: e.kind, name: e.name })),
+    )
+  }
+
+  function pasteClipboard(destDir: string = path) {
+    if (!clipboard?.length || busy) return
+    let target = destDir
+    if (
+      destDir === path &&
+      selectedEntries.length === 1 &&
+      selectedEntries[0].kind === 'dir'
+    ) {
+      target = selectedEntries[0].path
+    }
+    copyMut.mutate(
+      clipboard.map((item) => ({
+        src: item.path,
+        destDir: target,
+        kind: item.kind,
+      })),
+    )
   }
 
   function parseDrag(e: DragEvent): DragPayload | null {
@@ -1387,7 +1777,11 @@ export default function Workspace() {
     if (dataTransferIsVaultMove(e.dataTransfer)) {
       const payload = parseDrag(e)
       if (!canDropOn(destDir, payload) || !payload) return
-      moveMut.mutate({ src: payload.path, destDir, kind: payload.kind })
+      if (e.altKey) {
+        copyMut.mutate([{ src: payload.path, destDir, kind: payload.kind }])
+      } else {
+        moveMut.mutate({ src: payload.path, destDir, kind: payload.kind })
+      }
       return
     }
 
@@ -1402,7 +1796,13 @@ export default function Workspace() {
     if (dataTransferIsVaultMove(dt) || dataTransferHasFiles(dt)) {
       e.preventDefault()
       e.stopPropagation()
-      if (dt) dt.dropEffect = dataTransferIsVaultMove(dt) ? 'move' : 'copy'
+      if (dt) {
+        if (dataTransferIsVaultMove(dt)) {
+          dt.dropEffect = e.altKey ? 'copy' : 'move'
+        } else {
+          dt.dropEffect = 'copy'
+        }
+      }
       setDropTarget(destDir)
     }
   }
@@ -1419,6 +1819,7 @@ export default function Workspace() {
         ? () => setDropTarget((t) => (t === entry.path ? null : t))
         : undefined,
       onDrop: isDir ? (e: DragEvent) => onDropOnto(entry.path, e) : undefined,
+      onContextMenu: (e: MouseEvent) => openEntryContextMenu(entry, e),
     }
   }
 
@@ -1439,7 +1840,10 @@ export default function Workspace() {
         ) : null}
         <div className="panel-body" style={{ display: 'grid', placeItems: 'center' }}>
           <div className="modal" style={{ width: 'min(360px, 92vw)' }}>
-            <div className="modal-header">Sign in</div>
+            <div className="modal-header">
+              <SignInIcon />
+              Sign in
+            </div>
             <div className="modal-body">
               <div>
                 <div className="field-label">Username</div>
@@ -1529,7 +1933,10 @@ export default function Workspace() {
           >
             <div className="panel">
               <div className="panel-header">
-                <div className="panel-title">Accounts</div>
+                <div className="panel-title">
+                  <AccountsIcon />
+                  Accounts
+                </div>
                 <div className="panel-header-actions">
                   <button
                     type="button"
@@ -1821,7 +2228,10 @@ export default function Workspace() {
                     <PanelChevron dir="right" />
                   </button>
                 ) : null}
-                <div className="panel-title">Vault</div>
+                <div className="panel-title">
+                  <VaultIcon />
+                  Vault
+                </div>
                 <div className="panel-header-actions">
                   <input
                     ref={fileInputRef}
@@ -1892,9 +2302,31 @@ export default function Workspace() {
                     type="button"
                     className="btn-micro"
                     disabled={!canRename || busy}
-                    onClick={startRename}
+                    onClick={() => startRename()}
                   >
                     Rename
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-micro"
+                    disabled={selectedEntries.length === 0 || busy}
+                    onClick={copySelectionToClipboard}
+                    title="Copy (Ctrl/Cmd+C)"
+                  >
+                    Copy
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-micro"
+                    disabled={!clipboard?.length || busy}
+                    onClick={() => pasteClipboard()}
+                    title={
+                      clipboard?.length
+                        ? `Paste ${clipboard.length} item(s) (Ctrl/Cmd+V)`
+                        : 'Paste (Ctrl/Cmd+V)'
+                    }
+                  >
+                    Paste
                   </button>
                   <button
                     type="button"
@@ -1940,15 +2372,7 @@ export default function Workspace() {
                     type="button"
                     className="btn-micro btn-danger"
                     disabled={!canDelete || busy}
-                    onClick={() => {
-                      const dirs = selectedDirs.length
-                      const msg =
-                        dirs > 0
-                          ? `Delete ${selectedEntries.length} item(s), including ${dirs} folder(s) and their contents?`
-                          : null
-                      if (msg && !window.confirm(msg)) return
-                      deleteFileMut.mutate(selectedEntries)
-                    }}
+                    onClick={() => confirmDeleteEntries(selectedEntries)}
                   >
                     {deleteFileMut.isPending
                       ? 'Deleting…'
@@ -1992,41 +2416,64 @@ export default function Workspace() {
                 </div>
               </div>
 
-              <div className="breadcrumbs">
+              <nav className="breadcrumbs" aria-label="Vault path" title={path}>
                 <button
                   type="button"
-                  className={`crumb${dropTarget === '/' ? ' drop-target' : ''}`}
+                  className={`crumb crumb-root${path === '/' ? ' is-current' : ''}${
+                    dropTarget === '/' ? ' drop-target' : ''
+                  }`}
                   onClick={() => goCrumb(-1)}
                   onDragOver={(e) => onDragOverDest('/', e)}
                   onDragLeave={() => setDropTarget((t) => (t === '/' ? null : t))}
                   onDrop={(e) => onDropOnto('/', e)}
+                  aria-current={path === '/' ? 'location' : undefined}
+                  title="Vault root"
                 >
-                  /
+                  <VaultRootIcon />
+                  <span>Vault</span>
                 </button>
-                {crumbs.map((part, i) => {
-                  const crumbPath = '/' + crumbs.slice(0, i + 1).join('/')
+                {crumbItems.map((item, i) => {
+                  if (item.kind === 'ellipsis') {
+                    return (
+                      <span key={`ellipsis-${i}`} className="crumb-segment">
+                        <CrumbChevron />
+                        <button
+                          type="button"
+                          className="crumb crumb-ellipsis"
+                          onClick={() => setCrumbsExpanded(true)}
+                          title="Show full path"
+                          aria-label="Show full path"
+                        >
+                          …
+                        </button>
+                      </span>
+                    )
+                  }
+                  const crumbPath = '/' + crumbs.slice(0, item.index + 1).join('/')
+                  const isCurrent = item.index === crumbs.length - 1
                   return (
-                    <span key={`${part}-${i}`} style={{ display: 'inline-flex', gap: 4 }}>
-                      <span className="crumb-sep">/</span>
+                    <span key={`${item.name}-${item.index}`} className="crumb-segment">
+                      <CrumbChevron />
                       <button
                         type="button"
-                        className={`crumb${dropTarget === crumbPath ? ' drop-target' : ''}`}
-                        onClick={() => goCrumb(i)}
+                        className={`crumb${isCurrent ? ' is-current' : ''}${
+                          dropTarget === crumbPath ? ' drop-target' : ''
+                        }`}
+                        onClick={() => goCrumb(item.index)}
                         onDragOver={(e) => onDragOverDest(crumbPath, e)}
                         onDragLeave={() =>
                           setDropTarget((t) => (t === crumbPath ? null : t))
                         }
                         onDrop={(e) => onDropOnto(crumbPath, e)}
+                        aria-current={isCurrent ? 'location' : undefined}
+                        title={crumbPath}
                       >
-                        {part}
+                        {item.name}
                       </button>
                     </span>
                   )
                 })}
-                <span className="list-row-meta" style={{ marginLeft: 8 }}>
-                  upload → {path}
-                </span>
-              </div>
+              </nav>
 
               <div className="vault-search">
                 <input
@@ -2132,6 +2579,7 @@ export default function Workspace() {
                                   .join(' ')}
                                 onClick={(e) => selectEntry(entry, e)}
                                 onDoubleClick={() => openEntry(entry)}
+                                onContextMenu={(e) => openEntryContextMenu(entry, e)}
                                 title={entry.path}
                               >
                                 <input
@@ -2145,7 +2593,14 @@ export default function Workspace() {
                                   }
                                   aria-label={`Select ${entry.name}`}
                                 />
-                                <FileThumb entry={entry} size="lg" />
+                                <FileThumb
+                                  entry={
+                                    searchSkipThumbs
+                                      ? { ...entry, thumb_status: 'none' }
+                                      : entry
+                                  }
+                                  size="lg"
+                                />
                                 <span className={`file-grid-name ${entry.kind}`}>
                                   {entry.name}
                                 </span>
@@ -2187,6 +2642,7 @@ export default function Workspace() {
                                 className={isSelected ? 'selected' : undefined}
                                 onClick={(e) => selectEntry(entry, e)}
                                 onDoubleClick={() => openEntry(entry)}
+                                onContextMenu={(e) => openEntryContextMenu(entry, e)}
                               >
                                 <td
                                   className="col-check"
@@ -2204,7 +2660,13 @@ export default function Workspace() {
                                   />
                                 </td>
                                 <td className="col-thumb">
-                                  <FileThumb entry={entry} />
+                                  <FileThumb
+                                    entry={
+                                      searchSkipThumbs
+                                        ? { ...entry, thumb_status: 'none' }
+                                        : entry
+                                    }
+                                  />
                                 </td>
                                 <td>
                                   <span className={`file-name ${entry.kind}`}>
@@ -2389,7 +2851,10 @@ export default function Workspace() {
           >
             <div className="panel">
               <div className="panel-header">
-                <div className="panel-title">Inspect</div>
+                <div className="panel-title">
+                  <InspectIcon />
+                  Inspect
+                </div>
                 <div className="panel-header-actions">
                   <button
                     type="button"
@@ -2506,7 +2971,10 @@ export default function Workspace() {
       {megaOpen ? (
         <div className="modal-backdrop" onClick={() => setMegaOpen(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-header">Connect MEGA</div>
+            <div className="modal-header">
+              <MegaIcon />
+              Connect MEGA
+            </div>
             <div className="modal-body">
               <div>
                 <div className="field-label">Email</div>
@@ -2566,7 +3034,10 @@ export default function Workspace() {
       {mkdirOpen ? (
         <div className="modal-backdrop" onClick={() => setMkdirOpen(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-header">New folder</div>
+            <div className="modal-header">
+              <FolderIcon />
+              New folder
+            </div>
             <div className="modal-body">
               <div>
                 <div className="field-label">Name</div>
@@ -2605,7 +3076,10 @@ export default function Workspace() {
       {renameOpen ? (
         <div className="modal-backdrop" onClick={() => setRenameOpen(false)}>
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-header">Rename</div>
+            <div className="modal-header">
+              <RenameIcon />
+              Rename
+            </div>
             <div className="modal-body">
               <div>
                 <div className="field-label">New name</div>
@@ -2644,9 +3118,30 @@ export default function Workspace() {
           kind={filePreview.kind}
           imagePeers={previewImagePeers}
           maxBytes={previewMaxBytes}
+          videoMaxBytes={videoPreviewMaxBytes}
           onClose={() => setFilePreview(null)}
           onDownload={(e) => downloadMut.mutate([e])}
           onChangeEntry={(e) => setFilePreview({ entry: e, kind: 'image' })}
+        />
+      ) : null}
+
+      {ctxMenu ? (
+        <FileContextMenu
+          menu={ctxMenu}
+          currentPath={path}
+          busy={busy}
+          canPaste={!!clipboard?.length}
+          onClose={() => setCtxMenu(null)}
+          onOpen={openEntry}
+          onDownload={(entries) => downloadMut.mutate(entries)}
+          onCopy={(entries) => {
+            setClipboard(
+              entries.map((e) => ({ path: e.path, kind: e.kind, name: e.name })),
+            )
+          }}
+          onPaste={(destDir) => pasteClipboard(destDir)}
+          onRename={(entry) => startRename(entry)}
+          onDelete={confirmDeleteEntries}
         />
       ) : null}
 
@@ -2658,7 +3153,10 @@ export default function Workspace() {
           }}
         >
           <div className="modal modal-wide" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-header">Upload conflicts</div>
+            <div className="modal-header">
+              <ConflictIcon />
+              Upload conflicts
+            </div>
             <div className="modal-body">
               <div className="conflict-summary">
                 <span className="data">{uploadConflict.scan.conflicts.length}</span>{' '}
@@ -2771,7 +3269,10 @@ export default function Workspace() {
           }}
         >
           <div className="modal modal-wide" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-header">Prune accounts</div>
+            <div className="modal-header">
+              <PruneIcon />
+              Prune accounts
+            </div>
             <div className="modal-body">
               {pruneAnalyzing || !pruneReport ? (
                 <div className="prune-empty">Analyzing provider vaults…</div>
@@ -2915,7 +3416,10 @@ export default function Workspace() {
           }}
         >
           <div className="modal modal-wide" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-header">Shard health</div>
+            <div className="modal-header">
+              <HealthIcon />
+              Shard health
+            </div>
             <div className="modal-body">
               {healthRunning || !healthReport ? (
                 <div className="prune-empty">Checking indexed shards on providers…</div>
@@ -3028,7 +3532,10 @@ export default function Workspace() {
           }}
         >
           <div className="modal" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-header">Account still holds data</div>
+            <div className="modal-header">
+              <EvacuateIcon />
+              Account still holds data
+            </div>
             <div className="modal-body">
               <div className="prune-summary">
                 <span className="list-row-label" title={evacuateDetail.label ?? undefined}>
@@ -3060,21 +3567,33 @@ export default function Workspace() {
                 </div>
               ) : null}
               <div className="prune-empty">
-                Move this data onto your other enabled accounts, then disconnect.
+                {evacuateMut.isPending
+                  ? 'Moving data now. Stop safely finishes in-flight objects, keeps the account, and lets you resume later.'
+                  : 'Move this data onto your other enabled accounts, then disconnect. Safe to stop mid-way and run again.'}
               </div>
             </div>
             <div className="modal-actions">
-              <button
-                type="button"
-                className="btn"
-                disabled={evacuateMut.isPending}
-                onClick={() => {
-                  setEvacuateOpen(false)
-                  setEvacuateDetail(null)
-                }}
-              >
-                Cancel
-              </button>
+              {evacuateMut.isPending ? (
+                <button
+                  type="button"
+                  className="btn-danger"
+                  title="Stop after in-flight objects finish. Moved data is kept; run again to continue."
+                  onClick={() => jobAbortRef.current?.abort()}
+                >
+                  Stop safely
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => {
+                    setEvacuateOpen(false)
+                    setEvacuateDetail(null)
+                  }}
+                >
+                  Close
+                </button>
+              )}
               <button
                 type="button"
                 className="btn-primary"

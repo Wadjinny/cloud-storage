@@ -15,6 +15,8 @@ from starlette.requests import ClientDisconnect
 
 from config import THUMB_CACHE_MAX_AGE, choose_chunk_size
 from deps import require_unlocked
+from providers.errors import ProviderError
+from services import copy_vault as copy_vault_service
 from services import vault as vault_service
 from services import zip_download as zip_download_service
 from services.account_lock import accounts_manageable
@@ -54,6 +56,12 @@ class MoveBody(BaseModel):
     kind: str | None = Field(default=None, description="'file' or 'dir'")
 
 
+class CopyBody(BaseModel):
+    src_path: str = Field(min_length=1)
+    dest_path: str = Field(min_length=1)
+    kind: str | None = Field(default=None, description="'file' or 'dir'")
+
+
 class ZipItemBody(BaseModel):
     kind: str = Field(description="'file' or 'dir'")
     path: str = Field(min_length=1)
@@ -70,7 +78,7 @@ class DeleteDirBody(BaseModel):
 
 @router.get("/status")
 def vault_status(request: Request) -> dict[str, bool | int | str | None]:
-    from config import PREVIEW_MAX_BYTES, SHARD_UPLOAD_CONCURRENCY
+    from config import PREVIEW_MAX_BYTES, SHARD_UPLOAD_CONCURRENCY, VIDEO_PREVIEW_MAX_BYTES
     from services import crypto
 
     unlocked = bool(request.session.get("vault_unlocked"))
@@ -92,6 +100,7 @@ def vault_status(request: Request) -> dict[str, bool | int | str | None]:
                     "accounts_locked": not accounts_manageable(str(user_id)),
                     "shard_upload_concurrency": SHARD_UPLOAD_CONCURRENCY,
                     "preview_max_bytes": PREVIEW_MAX_BYTES,
+                    "video_preview_max_bytes": VIDEO_PREVIEW_MAX_BYTES,
                 }
     return {
         "unlocked": False,
@@ -102,6 +111,7 @@ def vault_status(request: Request) -> dict[str, bool | int | str | None]:
         "accounts_locked": False,
         "shard_upload_concurrency": SHARD_UPLOAD_CONCURRENCY,
         "preview_max_bytes": PREVIEW_MAX_BYTES,
+        "video_preview_max_bytes": VIDEO_PREVIEW_MAX_BYTES,
     }
 
 
@@ -227,6 +237,25 @@ def move_entry(request: Request, body: MoveBody) -> dict:
     return entry
 
 
+@router.post("/copy")
+def copy_entry(request: Request, body: CopyBody) -> dict:
+    master_key = require_unlocked(request)
+    user_id = auth_context.require_user_id()
+    job_id = jobs.run_in_thread(
+        "copy",
+        user_id=user_id,
+        master_key=master_key,
+        work=lambda on_progress: copy_vault_service.copy_entry(
+            src_path=body.src_path,
+            dest_path=body.dest_path,
+            kind=body.kind,
+            on_progress=on_progress,
+        ),
+        queued_message="Starting copy…",
+    )
+    return {"job_id": job_id}
+
+
 @router.post("/dirs/delete")
 def delete_dir(request: Request, body: DeleteDirBody) -> dict:
     from storage import folders as folders_store
@@ -305,13 +334,13 @@ def get_job(request: Request, job_id: str) -> dict:
 
 
 _CANCELABLE_JOB_KINDS = frozenset(
-    {"health", "delete_file", "delete_dir", "evacuate"}
+    {"health", "delete_file", "delete_dir", "evacuate", "copy", "upload", "download"}
 )
 
 
 @router.post("/jobs/{job_id}/cancel")
 def cancel_job(request: Request, job_id: str) -> dict[str, bool]:
-    """Cancel a running health, delete, or evacuate job."""
+    """Cancel a running health, delete, evacuate, copy, upload, or download job."""
     require_unlocked(request)
     user_id = auth_context.require_user_id()
     job = jobs.get(job_id)
@@ -319,15 +348,28 @@ def cancel_job(request: Request, job_id: str) -> dict[str, bool]:
         raise HTTPException(status_code=404, detail="Job not found")
     if job.kind not in _CANCELABLE_JOB_KINDS:
         raise HTTPException(status_code=400, detail="Job cannot be cancelled")
+    if job.kind == "upload":
+        pipeline = upload_pipelines.get(job_id)
+        session_id = pipeline.session_id if pipeline is not None else None
+        upload_pipelines.abort(job_id, "Upload cancelled")
+        if session_id:
+            vault_service.discard_upload_session(session_id)
+        return {"ok": True}
+    if job.kind == "download":
+        download_sessions.abort(job_id, "Download cancelled")
+        return {"ok": True}
     if job.status != "running" and not job.cancel_requested:
         return {"ok": True}
     message = {
         "health": "Health check cancelled",
         "delete_file": "Delete cancelled",
         "delete_dir": "Delete cancelled",
-        "evacuate": "Evacuate cancelled",
+        "evacuate": "Stopping evacuate safely…",
+        "copy": "Copy cancelled",
     }.get(job.kind, "Cancelled")
-    jobs.request_cancel(job_id, message)
+    # Soft-cancel thread jobs so workers can drain in-flight work (evacuate)
+    # before the job flips to error with the final message.
+    jobs.request_cancel(job_id, message, finalize=False)
     return {"ok": True}
 
 
@@ -469,6 +511,22 @@ async def upload_resume(request: Request, body: UploadResumeBody) -> dict:
     }
 
 
+@router.post("/upload/cancel-all")
+def cancel_all_uploads(request: Request) -> dict[str, Any]:
+    """Abort every in-flight upload pipeline for the current user."""
+    require_unlocked(request)
+    user_id = auth_context.require_user_id()
+    session_ids = upload_pipelines.abort_all_for_user(user_id, "Upload cancelled")
+    for session_id in session_ids:
+        vault_service.discard_upload_session(session_id)
+    log.info(
+        "upload cancel-all user_id=%s pipelines=%s",
+        user_id,
+        len(session_ids),
+    )
+    return {"ok": True, "cancelled": len(session_ids)}
+
+
 @router.post("/upload/{job_id}/cancel")
 def cancel_upload(request: Request, job_id: str) -> dict[str, bool]:
     require_unlocked(request)
@@ -598,6 +656,20 @@ async def upload_stream(request: Request, job_id: str) -> dict:
             received,
             expected_body,
         )
+        # Cancel API and fetch abort race: give cancel a moment to land, otherwise
+        # finish() keeps uploading already-queued shards after the user hit Cancel.
+        if not (
+            pipeline.cancel_requested.is_set() or jobs.is_cancel_requested(job_id)
+        ):
+            await asyncio.sleep(0.15)
+        if pipeline.cancel_requested.is_set() or jobs.is_cancel_requested(job_id):
+            try:
+                await asyncio.to_thread(
+                    upload_pipelines.abort, job_id, "Upload cancelled"
+                )
+            except Exception:
+                pass
+            raise HTTPException(status_code=409, detail="Upload cancelled") from None
         # Keep remote progress for resume (do not treat disconnect as cancel wipe).
         try:
             await asyncio.to_thread(upload_pipelines.finish, job_id)
@@ -678,18 +750,34 @@ async def start_zip_download(request: Request, body: ZipDownloadBody) -> dict:
 
     job = jobs.create("download_zip", user_id=user_id)
     job.result_name = zip_filename
+    member_names = [str(m["arcname"]) for m in members]
+    zip_total_bytes = max(1, sum(max(1, int(m.get("size") or 0)) for m in members))
     job.result_meta = {
         "path": zip_filename,
         "filename": zip_filename,
         "kind": "zip",
         "file_count": len(members),
+        "files": member_names,
+        "empty_dirs": empty_dirs,
     }
     jobs.update(
         job.id,
         phase="queued",
-        message="Waiting for zip stream…",
+        message=f"Waiting for zip stream ({len(members)} file(s))…",
         current=0,
-        total=max(1, len(members)),
+        total=zip_total_bytes,
+        stats={
+            "zip_file_index": 0,
+            "zip_file_total": len(members),
+            "zip_arcname": member_names[0] if member_names else None,
+            "zip_prefetching": [],
+            "done_bytes": 0,
+            "total_bytes": zip_total_bytes,
+            "done_shards": 0,
+            "expected_shards": 0,
+            "active_shards": 0,
+            "by_account": [],
+        },
     )
     download_sessions.start(
         job_id=job.id,
@@ -705,6 +793,8 @@ async def start_zip_download(request: Request, body: ZipDownloadBody) -> dict:
         "job_id": job.id,
         "filename": zip_filename,
         "file_count": len(members),
+        "files": member_names,
+        "empty_dirs": empty_dirs,
         "size": None,
     }
 
@@ -816,17 +906,18 @@ def download_stream(request: Request, job_id: str) -> StreamingResponse:
                     return
                 job = jobs.get(job_id)
                 if job is None or job.status == "running":
-                    jobs.fail(
-                        job_id,
-                        str(exc),
-                        result_meta={
-                            "path": session.filename,
-                            "filename": session.filename,
-                            "file_id": session.file_id,
-                            "kind": session.kind,
-                        },
-                    )
-                raise
+                    result_meta: dict[str, Any] = {
+                        "path": session.filename,
+                        "filename": session.filename,
+                        "file_id": session.file_id,
+                        "kind": session.kind,
+                    }
+                    if isinstance(exc, ProviderError):
+                        result_meta.update(exc.to_meta())
+                    jobs.fail(job_id, str(exc), result_meta=result_meta)
+                log.exception("download failed job_id=%s", job_id)
+                # End the stream quietly; SSE job.error is the UI channel.
+                return
             finally:
                 download_sessions.finish(job_id)
 

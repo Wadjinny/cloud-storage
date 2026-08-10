@@ -29,7 +29,7 @@ from config import (
 )
 from providers.factory import get_provider
 from services.capacity import PlacementPlanner, estimate_shard_cipher_bytes
-from services.jobs import JobCancelled, raise_if_cancelled
+from services.jobs import JobCancelled, raise_if_cancelled, should_abort
 from storage import accounts as accounts_store
 from storage import auth_context
 from storage import folder_remotes
@@ -48,10 +48,26 @@ def _emit(
     current: int,
     total: int,
     message: str,
+    *,
+    stats: dict[str, Any] | None = None,
 ) -> None:
     if cb is None:
         return
-    cb(phase, current, total, message)
+    if stats is None:
+        cb(phase, current, total, message)
+    else:
+        try:
+            cb(phase, current, total, message, stats)
+        except TypeError:
+            cb(phase, current, total, message)
+
+
+def _cancel_message(*, moved_shards: int, moved_thumbs: int) -> str:
+    return (
+        f"Evacuate cancelled after moving {moved_shards} shard(s) "
+        f"and {moved_thumbs} thumbnail(s). "
+        "Account kept; run again to continue."
+    )
 
 
 def _fmt_bytes(n: int) -> str:
@@ -153,6 +169,8 @@ def evacuate_and_delete(
     work_items: list[dict[str, Any]] = [*shards, *thumbs]
 
     if not work_items:
+        source_provider = get_provider(account)
+        _delete_source_vault_root(source_provider, account, on_progress)
         _emit(on_progress, "delete", 0, 1, "Disconnecting empty account…")
         _delete_account_row(account)
         _emit(on_progress, "done", 1, 1, "Done")
@@ -287,8 +305,9 @@ def evacuate_and_delete(
     def _upload_one(
         item: dict[str, Any], data: bytes
     ) -> tuple[dict[str, Any], str, int]:
+        # Once an object is handed to upload, finish it so the index stays
+        # consistent even if the user requested a safe cancel.
         try:
-            raise_if_cancelled("Evacuate cancelled")
             with auth_context.auth_scope(user_id, master_key):
                 kind = item["kind"]
                 file_id = item["file_id"]
@@ -297,7 +316,6 @@ def evacuate_and_delete(
                 dest_sem = dest_slots[dest_account_id]
                 dest_sem.acquire()
                 try:
-                    raise_if_cancelled("Evacuate cancelled")
                     parent_id = _folder_for(file_id, path, dest_account_id)
                     # Unique name so source folder cleanup cannot wipe the dest
                     # object when providers share a name-keyed store.
@@ -352,6 +370,27 @@ def evacuate_and_delete(
             fut = download_pool.submit(copy_context().run, _download_one, item)
             download_futs[fut] = item
 
+    stop_new = False
+
+    def _stats() -> dict[str, Any]:
+        return {
+            "done_shards": done_count,
+            "expected_shards": len(work_items),
+            "done_bytes": done_bytes,
+            "total_bytes": total_bytes,
+            "active_shards": len(download_futs) + len(upload_futs),
+            "chunk_size": 0,
+            "by_account": [],
+        }
+
+    def _soft_emit(phase: str, current: int, total: int, message: str) -> None:
+        """Progress update that turns cancel into a soft stop (does not abort drains)."""
+        nonlocal stop_new
+        try:
+            _emit(on_progress, phase, current, total, message, stats=_stats())
+        except JobCancelled:
+            stop_new = True
+
     def _on_upload_done(item: dict[str, Any], kind: str, nbytes: int) -> None:
         nonlocal done_count, done_bytes, moved_shards, moved_thumbs, total_bytes
         nonlocal progress_total
@@ -377,15 +416,27 @@ def evacuate_and_delete(
                     f"Moved {label} shard {item['i']} "
                     f"({_fmt_bytes(done_bytes)}/{_fmt_bytes(total_bytes)})…"
                 )
-            _emit(on_progress, "evacuate", done_bytes, progress_total, msg)
+            _soft_emit("evacuate", done_bytes, progress_total, msg)
+
+    def _discard_download(fut: Future[tuple[dict[str, Any], bytes]]) -> None:
+        try:
+            fut.result()
+        except Exception:
+            # _download_one already released live_slots on failure / cancel.
+            return
+        live_slots.release()
 
     try:
         _submit_downloads()
-        while download_futs or upload_futs or next_index < n:
-            raise_if_cancelled("Evacuate cancelled")
-            _submit_downloads()
+        while download_futs or upload_futs or (not stop_new and next_index < n):
+            if should_abort():
+                stop_new = True
+            if not stop_new:
+                _submit_downloads()
             pending = set(download_futs) | set(upload_futs)
             if not pending:
+                if stop_new or next_index >= n:
+                    break
                 _submit_downloads()
                 pending = set(download_futs) | set(upload_futs)
                 if not pending:
@@ -395,24 +446,39 @@ def evacuate_and_delete(
                 continue
             for fut in done:
                 if fut in download_futs:
-                    item = download_futs.pop(fut)
+                    download_futs.pop(fut)
+                    if stop_new or should_abort():
+                        stop_new = True
+                        _discard_download(fut)
+                        continue
                     try:
                         got_item, data = fut.result()
+                    except JobCancelled:
+                        stop_new = True
+                        continue
                     except Exception:
                         raise
+                    if stop_new or should_abort():
+                        stop_new = True
+                        live_slots.release()
+                        continue
                     upload_fut = upload_pool.submit(
                         copy_context().run, _upload_one, got_item, data
                     )
                     upload_futs[upload_fut] = got_item
                 else:
-                    item = upload_futs.pop(fut)
+                    upload_futs.pop(fut)
                     got_item, kind, nbytes = fut.result()
                     _on_upload_done(got_item, kind, nbytes)
-            _submit_downloads()
-    except JobCancelled:
-        download_pool.shutdown(wait=False, cancel_futures=True)
-        upload_pool.shutdown(wait=False, cancel_futures=True)
-        raise
+            if not stop_new:
+                _submit_downloads()
+            elif stop_new and download_futs:
+                _soft_emit(
+                    "evacuate",
+                    done_bytes,
+                    progress_total,
+                    "Stopping safely: finishing in-flight moves…",
+                )
     except Exception:
         download_pool.shutdown(wait=False, cancel_futures=True)
         upload_pool.shutdown(wait=False, cancel_futures=True)
@@ -421,7 +487,11 @@ def evacuate_and_delete(
         download_pool.shutdown(wait=True, cancel_futures=False)
         upload_pool.shutdown(wait=True, cancel_futures=False)
 
-    raise_if_cancelled("Evacuate cancelled")
+    if stop_new or should_abort():
+        raise JobCancelled(
+            _cancel_message(moved_shards=moved_shards, moved_thumbs=moved_thumbs)
+        )
+
     # Prefer one folder delete per file (covers shards/thumbs inside). Only delete
     # loose remotes when there is no per-file folder. Parallelize with progress so
     # large accounts do not look stuck on "Cleaning source remotes…".
@@ -461,18 +531,20 @@ def evacuate_and_delete(
     cleanup_done = 0
     cleanup_lock = threading.Lock()
 
-    _emit(
-        on_progress,
+    _soft_emit(
         "cleanup",
         total_bytes,
         progress_total,
         f"Cleaning source remotes ({len(folders_to_delete)} folder(s), "
         f"{len(loose_remotes)} loose object(s))…",
     )
+    if stop_new or should_abort():
+        raise JobCancelled(
+            _cancel_message(moved_shards=moved_shards, moved_thumbs=moved_thumbs)
+        )
 
     def _cleanup_one(job: tuple[str, dict[str, Any]]) -> None:
         kind, payload = job
-        raise_if_cancelled("Evacuate cancelled")
         with auth_context.auth_scope(user_id, master_key):
             if kind == "folder":
                 try:
@@ -523,7 +595,14 @@ def evacuate_and_delete(
                 for job in cleanup_jobs
             }
             for fut in as_completed(futures):
-                raise_if_cancelled("Evacuate cancelled")
+                if should_abort():
+                    stop_new = True
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    raise JobCancelled(
+                        _cancel_message(
+                            moved_shards=moved_shards, moved_thumbs=moved_thumbs
+                        )
+                    )
                 fut.result()
                 job = futures[fut]
                 with cleanup_lock:
@@ -539,21 +618,31 @@ def evacuate_and_delete(
                             f"Removed remote {label} "
                             f"({cleanup_done}/{cleanup_n})…"
                         )
-                    _emit(
-                        on_progress,
+                    _soft_emit(
                         "cleanup",
                         total_bytes + cleanup_done,
                         progress_total,
                         msg,
                     )
+                    if stop_new:
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        raise JobCancelled(
+                            _cancel_message(
+                                moved_shards=moved_shards, moved_thumbs=moved_thumbs
+                            )
+                        )
         except JobCancelled:
-            pool.shutdown(wait=False, cancel_futures=True)
             raise
         except Exception:
             pool.shutdown(wait=False, cancel_futures=True)
             raise
         else:
             pool.shutdown(wait=True, cancel_futures=False)
+
+    if stop_new or should_abort():
+        raise JobCancelled(
+            _cancel_message(moved_shards=moved_shards, moved_thumbs=moved_thumbs)
+        )
 
     try:
         folder_remotes.delete_for_account(account_id)
@@ -567,6 +656,10 @@ def evacuate_and_delete(
             "retry or delete the remaining files"
         )
 
+    # Drop the opaque vault root (default name cloud-storage-vault) so the source
+    # account is left without leftover dir shells after all shards/thumbs moved.
+    _delete_source_vault_root(source_provider, account, on_progress=_soft_emit)
+
     _delete_account_row(account)
     _emit(on_progress, "done", progress_total, progress_total, "Done")
     return {
@@ -578,6 +671,46 @@ def evacuate_and_delete(
         "label": account.get("label"),
         "provider": account.get("provider"),
     }
+
+
+def _delete_source_vault_root(
+    provider: Any,
+    account: dict[str, Any],
+    on_progress: ProgressCb | None = None,
+) -> None:
+    """Remove the account's opaque vault root (``SHARD_FOLDER_NAME``) after evacuate."""
+    account_id = account["id"]
+    try:
+        root_id = provider.vault_root()
+    except Exception:
+        log.exception(
+            "evacuate vault root resolve failed account=%s provider=%s",
+            account_id,
+            account.get("provider"),
+        )
+        return
+    _emit(
+        on_progress,
+        "cleanup",
+        0,
+        1,
+        "Removing vault root folder…",
+    )
+    try:
+        provider.delete(root_id)
+        log.info(
+            "evacuate deleted vault root account=%s provider=%s root=%s",
+            account_id,
+            account.get("provider"),
+            root_id,
+        )
+    except Exception:
+        log.exception(
+            "evacuate vault root delete failed account=%s provider=%s root=%s",
+            account_id,
+            account.get("provider"),
+            root_id,
+        )
 
 
 def _delete_account_row(account: dict[str, Any]) -> None:

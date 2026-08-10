@@ -72,22 +72,26 @@ def record(
     return event
 
 
-def list_events(
+def _filter_clauses(
     user_id: str,
     *,
-    limit: int = 50,
     before: int | None = None,
+    since: int | None = None,
+    until: int | None = None,
     action: str | None = None,
     status: str | None = None,
-) -> list[dict[str, Any]]:
-    """Newest-first page for one user. Prunes expired rows first."""
-    prune_expired()
-    limit = max(1, min(int(limit), 200))
+) -> tuple[str, list[Any]]:
     clauses = ["user_id = ?"]
     params: list[Any] = [user_id]
     if before is not None:
         clauses.append("created_at < ?")
         params.append(int(before))
+    if since is not None:
+        clauses.append("created_at >= ?")
+        params.append(int(since))
+    if until is not None:
+        clauses.append("created_at <= ?")
+        params.append(int(until))
     if action:
         clauses.append("action = ?")
         params.append(action)
@@ -96,7 +100,30 @@ def list_events(
             raise ValueError(f"Invalid activity status: {status}")
         clauses.append("status = ?")
         params.append(status)
-    where = " AND ".join(clauses)
+    return " AND ".join(clauses), params
+
+
+def list_events(
+    user_id: str,
+    *,
+    limit: int = 50,
+    before: int | None = None,
+    since: int | None = None,
+    until: int | None = None,
+    action: str | None = None,
+    status: str | None = None,
+) -> list[dict[str, Any]]:
+    """Newest-first page for one user. Prunes expired rows first."""
+    prune_expired()
+    limit = max(1, min(int(limit), 200))
+    where, params = _filter_clauses(
+        user_id,
+        before=before,
+        since=since,
+        until=until,
+        action=action,
+        status=status,
+    )
     params.append(limit)
     with connect() as conn:
         rows = conn.execute(
@@ -131,3 +158,107 @@ def list_events(
             }
         )
     return out
+
+
+def summarize_events(
+    user_id: str,
+    *,
+    since: int | None = None,
+    until: int | None = None,
+    action: str | None = None,
+    status: str | None = None,
+) -> dict[str, Any]:
+    """Aggregate activity for metrics (counts + transfer bytes from meta)."""
+    prune_expired()
+    where, params = _filter_clauses(
+        user_id,
+        since=since,
+        until=until,
+        action=action,
+        status=status,
+    )
+    with connect() as conn:
+        by_status_rows = conn.execute(
+            f"""
+            SELECT status, COUNT(*) AS n
+            FROM activity_events
+            WHERE {where}
+            GROUP BY status
+            """,
+            params,
+        ).fetchall()
+        by_action_rows = conn.execute(
+            f"""
+            SELECT action, COUNT(*) AS n
+            FROM activity_events
+            WHERE {where}
+            GROUP BY action
+            ORDER BY n DESC, action ASC
+            """,
+            params,
+        ).fetchall()
+        # Transfer volume from job meta (upload/download size, evacuate moved_bytes).
+        byte_row = conn.execute(
+            f"""
+            SELECT
+              COALESCE(SUM(
+                CASE WHEN action = 'upload' AND status = 'success'
+                  THEN COALESCE(CAST(json_extract(meta_json, '$.size') AS INTEGER), 0)
+                  ELSE 0 END
+              ), 0) AS upload_bytes,
+              COALESCE(SUM(
+                CASE WHEN action IN ('download', 'download_zip') AND status = 'success'
+                  THEN COALESCE(CAST(json_extract(meta_json, '$.size') AS INTEGER), 0)
+                  ELSE 0 END
+              ), 0) AS download_bytes,
+              COALESCE(SUM(
+                CASE WHEN action = 'account_evacuate' AND status = 'success'
+                  THEN COALESCE(
+                    CAST(json_extract(meta_json, '$.moved_bytes') AS INTEGER), 0
+                  )
+                  ELSE 0 END
+              ), 0) AS evacuated_bytes,
+              COALESCE(SUM(
+                CASE WHEN action = 'upload' AND status = 'success' THEN 1 ELSE 0 END
+              ), 0) AS upload_ok,
+              COALESCE(SUM(
+                CASE WHEN action IN ('download', 'download_zip') AND status = 'success'
+                  THEN 1 ELSE 0 END
+              ), 0) AS download_ok,
+              COALESCE(SUM(
+                CASE WHEN action = 'account_evacuate' AND status = 'success'
+                  THEN 1 ELSE 0 END
+              ), 0) AS evacuate_ok
+            FROM activity_events
+            WHERE {where}
+            """,
+            params,
+        ).fetchone()
+
+    by_status = {s: 0 for s in ("success", "error", "cancelled")}
+    total = 0
+    for row in by_status_rows:
+        key = str(row["status"])
+        n = int(row["n"] or 0)
+        by_status[key] = n
+        total += n
+
+    by_action = [
+        {"action": str(row["action"]), "count": int(row["n"] or 0)}
+        for row in by_action_rows
+    ]
+
+    return {
+        "events": total,
+        "by_status": by_status,
+        "by_action": by_action,
+        "upload_bytes": int(byte_row["upload_bytes"] or 0) if byte_row else 0,
+        "download_bytes": int(byte_row["download_bytes"] or 0) if byte_row else 0,
+        "evacuated_bytes": int(byte_row["evacuated_bytes"] or 0) if byte_row else 0,
+        "upload_ok": int(byte_row["upload_ok"] or 0) if byte_row else 0,
+        "download_ok": int(byte_row["download_ok"] or 0) if byte_row else 0,
+        "evacuate_ok": int(byte_row["evacuate_ok"] or 0) if byte_row else 0,
+        "since": since,
+        "until": until,
+        "retention_days": HISTORY_RETENTION_DAYS,
+    }

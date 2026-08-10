@@ -6,6 +6,8 @@ from typing import Any
 from storage import auth_context
 from storage.db import connect, escape_like
 
+_UNSET: Any = object()
+
 
 def _thumb_from_row(file_row: Any) -> dict[str, Any]:
     keys = file_row.keys() if hasattr(file_row, "keys") else ()
@@ -171,6 +173,37 @@ def id_path_map(*, user_id: str | None = None) -> dict[str, str]:
             (uid,),
         ).fetchall()
     return {str(row["id"]): str(row["path"]) for row in rows}
+
+
+def list_search_rows(
+    *,
+    user_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Lightweight file rows for name search (no shard payloads)."""
+    uid = user_id or auth_context.require_user_id()
+    with connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT f.id AS id, f.path AS path, f.size AS size, f.mtime AS mtime,
+                   f.thumb_status AS thumb_status,
+                   (SELECT COUNT(*) FROM shards s WHERE s.file_id = f.id) AS shard_count
+            FROM files f
+            WHERE f.user_id = ?
+            ORDER BY f.path
+            """,
+            (uid,),
+        ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "path": row["path"],
+            "size": row["size"],
+            "mtime": row["mtime"],
+            "thumb_status": row["thumb_status"] or "none",
+            "shard_count": int(row["shard_count"] or 0),
+        }
+        for row in rows
+    ]
 
 
 def estimated_vault_bytes_by_account(
@@ -736,6 +769,8 @@ def rename_file_path(
     file_id: str,
     new_path: str,
     *,
+    remote_vault_dir_id: Any = _UNSET,
+    set_remote_vault_dir: bool = False,
     user_id: str | None = None,
 ) -> dict[str, Any] | None:
     uid = user_id or auth_context.require_user_id()
@@ -750,14 +785,25 @@ def rename_file_path(
         if conflict is not None:
             raise ValueError(f"A file already exists at {new_path}")
         now = int(time.time())
-        conn.execute(
-            """
-            UPDATE files
-            SET path = ?, mtime = ?, updated_at = ?
-            WHERE id = ? AND user_id = ?
-            """,
-            (new_path, now, now, file_id, uid),
-        )
+        if set_remote_vault_dir:
+            conn.execute(
+                """
+                UPDATE files
+                SET path = ?, mtime = ?, updated_at = ?, remote_vault_dir_id = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (new_path, now, now, remote_vault_dir_id, file_id, uid),
+            )
+            entry["remote_vault_dir_id"] = remote_vault_dir_id
+        else:
+            conn.execute(
+                """
+                UPDATE files
+                SET path = ?, mtime = ?, updated_at = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (new_path, now, now, file_id, uid),
+            )
         entry["path"] = new_path
         entry["mtime"] = now
         entry["updated_at"] = now

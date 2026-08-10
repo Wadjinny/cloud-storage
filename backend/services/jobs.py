@@ -10,7 +10,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any
 
-ProgressCb = Callable[[str, int, int, str], None]
+# phase, current, total, message, optional stats dict
+ProgressCb = Callable[..., None]
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +46,7 @@ _JOB_ACTION_MAP: dict[str, str] = {
     "prune": "prune",
     "prune_analyze": "prune_analyze",
     "evacuate": "account_evacuate",
+    "copy": "copy",
 }
 
 
@@ -125,11 +127,22 @@ class JobStore:
         self.update(job.id, phase="queued", message=queued_message, current=0, total=1)
 
         def _runner() -> None:
-            def on_progress(phase: str, current: int, total: int, message: str) -> None:
+            def on_progress(
+                phase: str,
+                current: int,
+                total: int,
+                message: str,
+                stats: dict[str, Any] | None = None,
+            ) -> None:
                 if self.is_cancel_requested(job.id):
-                    raise JobCancelled(job.error or "Cancelled")
+                    raise JobCancelled(job.message or job.error or "Cancelled")
                 self.update(
-                    job.id, phase=phase, current=current, total=total, message=message
+                    job.id,
+                    phase=phase,
+                    current=current,
+                    total=total,
+                    message=message,
+                    stats=stats,
                 )
 
             abort_token = _job_should_abort.set(
@@ -140,12 +153,14 @@ class JobStore:
                     try:
                         result = work(on_progress)
                         if self.is_cancel_requested(job.id):
+                            self.request_cancel(
+                                job.id, "Cancelled", finalize=True
+                            )
                             return
                         self.complete(job.id, result_meta=result)
                     except JobCancelled as exc:
                         msg = str(exc) or "Cancelled"
-                        if not self.is_cancel_requested(job.id):
-                            self.request_cancel(job.id, msg)
+                        self.request_cancel(job.id, msg, finalize=True)
                     except Exception as exc:
                         self.fail(job.id, str(exc))
             finally:
@@ -238,8 +253,16 @@ class JobStore:
         self._notify(job_id)
         self._record_activity(snapshot, "error")
 
-    def request_cancel(self, job_id: str, message: str = "Cancelled") -> bool:
-        """Mark job cancelled and fail it if still running. Returns False if missing."""
+    def request_cancel(
+        self,
+        job_id: str,
+        message: str = "Cancelled",
+        *,
+        finalize: bool = True,
+    ) -> bool:
+        """Request cancel. With ``finalize=False``, only signals the worker so it
+        can drain in-flight work; the worker must finalize later.
+        """
         snapshot: Job | None = None
         with self._lock:
             job = self._jobs.get(job_id)
@@ -247,11 +270,17 @@ class JobStore:
                 return False
             job.cancel_requested = True
             if job.status == "running":
-                job.status = "error"
-                job.phase = "error"
+                if finalize:
+                    job.status = "error"
+                    job.phase = "error"
+                    job.message = message
+                    job.error = message
+                    snapshot = job
+                else:
+                    job.message = message
+            elif finalize and job.status == "error" and message:
                 job.message = message
                 job.error = message
-                snapshot = job
         self._notify(job_id)
         if snapshot is not None:
             self._record_activity(snapshot, "cancelled")

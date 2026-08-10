@@ -23,5 +23,5 @@ def get_provider(
     if provider == "mega":
         return MegaProvider(credentials)
     if provider == "memory":
-        return MemoryProvider(credentials)
+        return MemoryProvider(credentials, account_id=account.get("id"))
     raise ValueError(f"Unknown provider: {provider}")

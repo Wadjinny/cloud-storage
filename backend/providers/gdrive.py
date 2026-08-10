@@ -460,6 +460,61 @@ class GDriveProvider:
             log.warning("gdrive delete failed id=%s: %s", remote_id, exc)
             raise
 
+    def vault_root(self) -> str:
+        return self._ensure_folder()
+
+    def move_item(self, remote_id: str, *, parent_id: str) -> None:
+        def _once() -> None:
+            def _do() -> None:
+                meta = (
+                    self._service()
+                    .files()
+                    .get(fileId=remote_id, fields="parents")
+                    .execute()
+                )
+                prev_parents = ",".join(meta.get("parents") or [])
+                body: dict[str, Any] = {}
+                kwargs: dict[str, Any] = {
+                    "fileId": remote_id,
+                    "addParents": parent_id,
+                    "fields": "id, parents",
+                    "body": body,
+                }
+                if prev_parents:
+                    kwargs["removeParents"] = prev_parents
+                self._service().files().update(**kwargs).execute()
+
+            self._run_timed(_do, op=f"move id={remote_id} → {parent_id}")
+
+        call_with_retries(
+            _once,
+            op=f"gdrive move id={remote_id}",
+            attempts=PROVIDER_OP_RETRIES,
+        )
+
+    def copy_item(self, remote_id: str, *, parent_id: str, name: str) -> str:
+        def _once() -> str:
+            def _do() -> str:
+                created = (
+                    self._service()
+                    .files()
+                    .copy(
+                        fileId=remote_id,
+                        body={"name": name, "parents": [parent_id]},
+                        fields="id",
+                    )
+                    .execute()
+                )
+                return created["id"]
+
+            return self._run_timed(_do, op=f"copy id={remote_id} → {parent_id}")
+
+        return call_with_retries(
+            _once,
+            op=f"gdrive copy id={remote_id}",
+            attempts=PROVIDER_OP_RETRIES,
+        )
+
     def quota(self) -> dict[str, int | None]:
         def _do() -> dict[str, int | None]:
             try:

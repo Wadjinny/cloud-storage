@@ -1,5 +1,6 @@
 import {
   createContext,
+  useCallback,
   useContext,
   useEffect,
   useMemo,
@@ -10,7 +11,7 @@ import {
   type RefObject,
   type SetStateAction,
 } from 'react'
-import type { UploadAccountStats } from './api/vault'
+import { cancelAllUploadJobs, type UploadAccountStats } from './api/vault'
 import { TransferBatchPanel } from './TransferBatchPanel'
 import type { TransferFileStatus, TransferTreeNode } from './transferTree'
 
@@ -21,6 +22,7 @@ export type TransferKind =
   | 'prune'
   | 'health'
   | 'evacuate'
+  | 'copy'
 
 export const TRANSFER_LABELS: Record<TransferKind, string> = {
   upload: 'Upload',
@@ -29,6 +31,7 @@ export const TRANSFER_LABELS: Record<TransferKind, string> = {
   prune: 'Prune',
   health: 'Health',
   evacuate: 'Move data',
+  copy: 'Copy',
 }
 
 export type AccountRate = { shardsPerSec: number; mbPerSec: number }
@@ -63,10 +66,14 @@ type TransferContextValue = {
   setTransfer: Dispatch<SetStateAction<TransferState | null>>
   batchQueue: BatchQueueState | null
   setBatchQueue: Dispatch<SetStateAction<BatchQueueState | null>>
+  /** True while an upload batch holds an AbortController (even if transfer UI shows another job). */
+  uploadActive: boolean
+  setUploadActive: Dispatch<SetStateAction<boolean>>
   uploadAbortRef: RefObject<AbortController | null>
   downloadAbortRef: RefObject<AbortController | null>
   /** Shared abort for delete / health (and other non upload-download jobs). */
   jobAbortRef: RefObject<AbortController | null>
+  cancelUploads: () => Promise<void>
 }
 
 const TransferContext = createContext<TransferContextValue | null>(null)
@@ -74,9 +81,16 @@ const TransferContext = createContext<TransferContextValue | null>(null)
 export function TransferProvider({ children }: { children: ReactNode }) {
   const [transfer, setTransfer] = useState<TransferState | null>(null)
   const [batchQueue, setBatchQueue] = useState<BatchQueueState | null>(null)
+  const [uploadActive, setUploadActive] = useState(false)
   const uploadAbortRef = useRef<AbortController | null>(null)
   const downloadAbortRef = useRef<AbortController | null>(null)
   const jobAbortRef = useRef<AbortController | null>(null)
+
+  const cancelUploads = useCallback(async () => {
+    // Server-side abort first so ClientDisconnect cannot finish() queued shards.
+    await cancelAllUploadJobs()
+    uploadAbortRef.current?.abort()
+  }, [])
 
   const value = useMemo(
     () => ({
@@ -84,11 +98,14 @@ export function TransferProvider({ children }: { children: ReactNode }) {
       setTransfer,
       batchQueue,
       setBatchQueue,
+      uploadActive,
+      setUploadActive,
       uploadAbortRef,
       downloadAbortRef,
       jobAbortRef,
+      cancelUploads,
     }),
-    [transfer, batchQueue],
+    [transfer, batchQueue, uploadActive, cancelUploads],
   )
 
   return (
@@ -186,56 +203,97 @@ function TransferOverlay() {
     transfer,
     batchQueue,
     setBatchQueue,
-    uploadAbortRef,
+    uploadActive,
     downloadAbortRef,
     jobAbortRef,
+    cancelUploads,
   } = useTransfer()
+
+  const showUploadCancel = uploadActive || transfer?.kind === 'upload'
+  // When another job steals/clears the transfer slot, keep a cancel affordance
+  // for background uploads that are still running.
+  const displayTransfer: TransferState | null =
+    transfer ??
+    (uploadActive
+      ? {
+          kind: 'upload',
+          percent: 0,
+          message: 'Uploads still running…',
+        }
+      : null)
 
   return (
     <>
-      {transfer ? (
+      {displayTransfer ? (
         <div className="transfer-bar">
           <div className="transfer-meta">
-            <span className="transfer-kind">{TRANSFER_LABELS[transfer.kind]}</span>
-            <span className="transfer-msg">{transfer.message}</span>
-            {transfer.itemTotal != null && transfer.itemTotal > 0 ? (
-              <span className="transfer-stats" title="Files in this batch">
-                {(transfer.itemIndex ?? 0) + 1}/{transfer.itemTotal} files
+            <span className="transfer-kind">{TRANSFER_LABELS[displayTransfer.kind]}</span>
+            <span className="transfer-msg">{displayTransfer.message}</span>
+            {displayTransfer.itemTotal != null && displayTransfer.itemTotal > 0 ? (
+              <span
+                className="transfer-stats"
+                title={
+                  displayTransfer.kind === 'download' && displayTransfer.itemTotal > 1
+                    ? 'Current file / files in archive'
+                    : 'Files in this batch'
+                }
+              >
+                {(displayTransfer.itemIndex ?? 0) + 1}/{displayTransfer.itemTotal}{' '}
+                {displayTransfer.itemTotal === 1 ? 'file' : 'files'}
               </span>
             ) : null}
-            <span className="transfer-pct">{transfer.percent}%</span>
-            {(transfer.kind === 'upload' || transfer.kind === 'download') &&
-            transfer.doneShards != null ? (
+            <span className="transfer-pct">{displayTransfer.percent}%</span>
+            {(displayTransfer.kind === 'upload' || displayTransfer.kind === 'download') &&
+            displayTransfer.doneShards != null ? (
               <span className="transfer-stats" title="Shards done / expected · active">
-                {transfer.doneShards}
-                {transfer.expectedShards != null ? `/${transfer.expectedShards}` : ''} sh
-                {(transfer.activeShards ?? 0) > 0 ? (
-                  <span className="transfer-active"> · {transfer.activeShards} active</span>
+                {displayTransfer.doneShards}
+                {displayTransfer.expectedShards != null
+                  ? `/${displayTransfer.expectedShards}`
+                  : ''}{' '}
+                sh
+                {(displayTransfer.activeShards ?? 0) > 0 ? (
+                  <span className="transfer-active">
+                    {' '}
+                    · {displayTransfer.activeShards} active
+                  </span>
                 ) : null}
               </span>
             ) : null}
-            {(transfer.kind === 'upload' || transfer.kind === 'download') &&
-            transfer.doneBytes != null ? (
+            {(displayTransfer.kind === 'upload' ||
+              displayTransfer.kind === 'download' ||
+              displayTransfer.kind === 'evacuate') &&
+            displayTransfer.doneBytes != null ? (
               <span className="transfer-stats" title="Transferred / total">
-                {formatBytes(transfer.doneBytes)}
-                {transfer.totalBytes != null ? ` / ${formatBytes(transfer.totalBytes)}` : ''}
+                {formatBytes(displayTransfer.doneBytes)}
+                {displayTransfer.totalBytes != null
+                  ? ` / ${formatBytes(displayTransfer.totalBytes)}`
+                  : ''}
               </span>
             ) : null}
-            {transfer.kind === 'upload' || transfer.kind === 'download' ? (
+            {displayTransfer.kind === 'upload' || displayTransfer.kind === 'download' ? (
               <span className="transfer-stats" title="1 min average">
-                {formatRate(transfer.shardsPerSec, 'sh/s')} · {formatRate(transfer.mbPerSec, 'MB/s')}
+                {formatRate(displayTransfer.shardsPerSec, 'sh/s')} ·{' '}
+                {formatRate(displayTransfer.mbPerSec, 'MB/s')}
               </span>
             ) : null}
-            {transfer.kind === 'upload' ? (
+            {displayTransfer.kind === 'evacuate' ? (
+              <span className="transfer-stats" title="1 min average">
+                {formatRate(displayTransfer.mbPerSec, 'MB/s')}
+              </span>
+            ) : null}
+            {showUploadCancel ? (
               <button
                 type="button"
                 className="btn-micro btn-danger"
-                onClick={() => uploadAbortRef.current?.abort()}
+                title="Stop all in-flight uploads"
+                onClick={() => {
+                  void cancelUploads()
+                }}
               >
-                Cancel
+                {displayTransfer.kind === 'upload' ? 'Cancel' : 'Cancel uploads'}
               </button>
             ) : null}
-            {transfer.kind === 'download' ? (
+            {displayTransfer.kind === 'download' ? (
               <button
                 type="button"
                 className="btn-micro btn-danger"
@@ -244,9 +302,7 @@ function TransferOverlay() {
                 Cancel
               </button>
             ) : null}
-            {transfer.kind === 'delete' ||
-            transfer.kind === 'health' ||
-            transfer.kind === 'evacuate' ? (
+            {displayTransfer.kind === 'delete' || displayTransfer.kind === 'health' ? (
               <button
                 type="button"
                 className="btn-micro btn-danger"
@@ -255,29 +311,43 @@ function TransferOverlay() {
                 Cancel
               </button>
             ) : null}
+            {displayTransfer.kind === 'evacuate' ? (
+              <button
+                type="button"
+                className="btn-micro btn-danger"
+                title="Stop after in-flight objects finish. Moved data is kept; run again to continue."
+                onClick={() => jobAbortRef.current?.abort()}
+              >
+                Stop safely
+              </button>
+            ) : null}
           </div>
-          {(transfer.kind === 'upload' || transfer.kind === 'download') &&
-          (transfer.expectedShards != null || (transfer.doneShards ?? 0) > 0) ? (
+          {(displayTransfer.kind === 'upload' || displayTransfer.kind === 'download') &&
+          (displayTransfer.expectedShards != null ||
+            (displayTransfer.doneShards ?? 0) > 0) ? (
             <ShardBoxesBar
-              done={transfer.doneShards ?? 0}
-              active={transfer.activeShards ?? 0}
+              done={displayTransfer.doneShards ?? 0}
+              active={displayTransfer.activeShards ?? 0}
               total={Math.max(
-                transfer.expectedShards ?? 0,
-                (transfer.doneShards ?? 0) + (transfer.activeShards ?? 0),
+                displayTransfer.expectedShards ?? 0,
+                (displayTransfer.doneShards ?? 0) + (displayTransfer.activeShards ?? 0),
                 1,
               )}
             />
           ) : (
             <div className="transfer-track">
-              <div className="transfer-fill" style={{ width: `${transfer.percent}%` }} />
+              <div
+                className="transfer-fill"
+                style={{ width: `${displayTransfer.percent}%` }}
+              />
             </div>
           )}
-          {transfer.itemLabel ? (
+          {displayTransfer.itemLabel ? (
             <div className="transfer-queue">
               <div className="transfer-queue-row">
                 <span className="transfer-queue-label">Current</span>
-                <span className="transfer-file" title={transfer.itemLabel}>
-                  {transfer.itemLabel}
+                <span className="transfer-file" title={displayTransfer.itemLabel}>
+                  {displayTransfer.itemLabel}
                 </span>
               </div>
             </div>

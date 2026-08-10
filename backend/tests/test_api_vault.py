@@ -141,7 +141,8 @@ def test_delete_removes_file_and_shards(unlocked_client: TestClient) -> None:
     assert remote_ids
     for rid in remote_ids:
         assert MemoryProvider._store.get(rid) is not None
-    assert f"dir_{file_id}" in MemoryProvider._folders
+    file_folders = [fid for fid in MemoryProvider._folders if fid.endswith(f"_{file_id}")]
+    assert file_folders
 
     resp = unlocked_client.delete(f"/api/vault/files/{file_id}")
     assert resp.status_code == 200
@@ -153,7 +154,7 @@ def test_delete_removes_file_and_shards(unlocked_client: TestClient) -> None:
     assert listing == []
     for rid in remote_ids:
         assert MemoryProvider._store.get(rid) is None
-    assert f"dir_{file_id}" not in MemoryProvider._folders
+    assert not any(fid.endswith(f"_{file_id}") for fid in MemoryProvider._folders)
 
 
 def test_cancel_upload(unlocked_client: TestClient) -> None:
@@ -178,7 +179,30 @@ def test_cancel_upload(unlocked_client: TestClient) -> None:
     assert listing == []
     # Per-file folder delete should leave no orphan shards in the memory provider.
     assert MemoryProvider._store == {}
-    assert MemoryProvider._folders == {MemoryProvider.VAULT_ROOT_ID: set()}
+    assert all(not children for children in MemoryProvider._folders.values())
+
+
+def test_cancel_all_uploads(unlocked_client: TestClient) -> None:
+    payload = bytes(range(256)) * (TEST_CHUNK_SIZE * 4)
+    job_ids: list[str] = []
+    for name in ("a.bin", "b.bin"):
+        start = unlocked_client.post(
+            "/api/vault/upload/start",
+            json={"filename": name, "size": len(payload)},
+        )
+        assert start.status_code == 200
+        job_ids.append(start.json()["job_id"])
+
+    cancel = unlocked_client.post("/api/vault/upload/cancel-all")
+    assert cancel.status_code == 200
+    assert cancel.json()["cancelled"] >= 1
+
+    for job_id in job_ids:
+        put = unlocked_client.put(f"/api/vault/upload/{job_id}", content=payload)
+        assert put.status_code in (404, 409, 502)
+        job = wait_job(unlocked_client, job_id)
+        assert job["status"] == "error"
+    assert unlocked_client.get("/api/vault/files").json() == []
 
 
 def test_accounts_list_and_storage(unlocked_client: TestClient) -> None:

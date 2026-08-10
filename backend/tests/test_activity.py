@@ -94,3 +94,20 @@ def test_activity_api_login_mkdir_upload(client: TestClient, memory_account) -> 
         e["action"] == "upload" and e["status"] == "success"
         for e in filtered.json()["events"]
     )
+
+    summary = client.get("/api/activity/summary")
+    assert summary.status_code == 200
+    body = summary.json()
+    assert body["events"] >= 4
+    assert body["by_status"]["success"] >= 1
+    assert body["by_status"]["error"] >= 1
+    assert body["upload_ok"] >= 1
+    assert body["upload_bytes"] >= len(b"hello-history")
+    assert any(row["action"] == "upload" for row in body["by_action"])
+
+    recent = client.get(
+        "/api/activity/summary",
+        params={"since": int(time.time()) + 3600},
+    )
+    assert recent.status_code == 200
+    assert recent.json()["events"] == 0
