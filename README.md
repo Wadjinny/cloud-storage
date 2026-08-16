@@ -26,10 +26,7 @@ Encrypted, sharded personal vault that spreads opaque file chunks across Google 
 ```bash
 cd backend
 uv sync
-# optional Google OAuth (see backend/.env):
-# FRONTEND_URL=http://localhost:5173
-# API_PUBLIC_URL=http://localhost:1234
-# GOOGLE_REDIRECT_URI=http://localhost:1234/api/auth/google/callback
+cp .env.example .env   # set SESSION_SECRET; fill Google OAuth to enable Drive
 uv run main.py
 ```
 
@@ -38,8 +35,10 @@ uv run main.py
 ```bash
 cd frontend
 pnpm install
+# optional: cp .env.example .env.development
 pnpm dev
 ```
+
 
 Open http://localhost:5173 (use `localhost`, not `127.0.0.1`, so session cookies stay same-site with `http://localhost:1234`). Prod builds leave `VITE_API_BASE` empty and hit same-origin `/api` through Caddy.
 
