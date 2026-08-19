@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from services import crypto
+from services import session_keys
 from storage import activity as activity_store
 from storage import auth_context
 from storage import users as users_store
@@ -36,6 +37,7 @@ def login(request: Request, body: LoginBody) -> dict[str, str | bool]:
     request.session["username"] = user["username"]
     request.session["master_key"] = crypto.b64e(master_key)
     auth_context.set_auth(user["id"], master_key)
+    session_keys.remember(user["id"], master_key)
     activity_store.record(
         user["id"],
         "login",
@@ -54,5 +56,6 @@ def logout(request: Request) -> dict[str, bool]:
     request.session.pop("master_key", None)
     auth_context.clear_auth()
     if user_id:
+        session_keys.forget(str(user_id))
         activity_store.record(str(user_id), "logout", "success")
     return {"ok": True}

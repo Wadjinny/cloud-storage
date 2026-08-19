@@ -309,6 +309,16 @@ body,
   flex-shrink: 0;
 }
 
+/* Manage mode adds enough buttons to overflow a narrow accounts panel. */
+.accounts-header-actions {
+  /* Shrinkable so the buttons wrap instead of pushing the collapse arrow out. */
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  row-gap: 4px;
+  flex-shrink: 1;
+  min-width: 0;
+}
+
 .panel-title {
   display: inline-flex;
   align-items: center;
@@ -437,6 +447,28 @@ body,
 
 .account-card .list-row {
   cursor: default;
+}
+
+.account-card.needs-reauth .provider-swatch {
+  background: var(--error);
+}
+
+.account-reauth {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 8px;
+  padding: 4px 6px;
+  border: 1px solid var(--error);
+  border-radius: var(--r-sm);
+  background: var(--error-bg);
+}
+
+.account-reauth-msg {
+  flex: 1;
+  min-width: 0;
+  font-size: 10px;
+  color: var(--error);
 }
 
 .storage-stats {

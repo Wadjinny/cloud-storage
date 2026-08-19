@@ -18,6 +18,7 @@ Encrypted, sharded personal vault that spreads opaque file chunks across Google 
 - Upload encrypts, splits into ~16 MiB shards (MEGA-tuned, serial by default), and stripes across connected accounts
 - Download reassembles and decrypts; delete removes shards + index entry
 - One account is enough; more accounts increase stripe width
+- Google tokens renew themselves in the background; an expired grant shows a one-click **Reconnect** on the account card (same account id, so shards stay attached)
 
 ## Run locally
 
@@ -53,6 +54,10 @@ Open http://localhost:5173 (use `localhost`, not `127.0.0.1`, so session cookies
 5. Set `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `FRONTEND_URL`, `API_PUBLIC_URL`, and `GOOGLE_REDIRECT_URI` in `backend/.env`.
 
 Without Google env vars, **+ Google** returns 503; MEGA still works.
+
+Connect/reconnect only works from the host in `API_PUBLIC_URL`. Opening the app on `http://127.0.0.1:5173` and connecting Google fails, because Google returns to the **localhost** callback and the session cookie set on `127.0.0.1` is never sent there. The backend rejects such a flow before the consent screen with that explanation; open `http://localhost:5173` instead (or register the `127.0.0.1` redirect URI in Google Cloud Console and point `API_PUBLIC_URL` at it).
+
+While the consent screen is in **Testing**, Google expires refresh tokens after 7 days: the account card then shows `Token expired` with a **Reconnect** button. Publishing the app (or adding the account as a test user and re-consenting) is the only way to stop that; renewal keeps tokens alive but cannot revive a grant Google has revoked.
 
 ## MEGA
 

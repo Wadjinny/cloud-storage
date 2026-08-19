@@ -8,10 +8,12 @@ from pydantic import BaseModel
 
 from config import STORAGE_FULL_RATIO
 from deps import require_accounts_manageable, require_unlocked
+from providers.errors import AccountAuthError
 from providers.factory import get_provider
 from services import evacuate as evacuate_service
 from services import health as health_service
 from services import prune as prune_service
+from services import token_renewal
 from services.capacity import headroom_bytes, is_full
 from services.jobs import jobs
 from storage import accounts as accounts_store
@@ -45,6 +47,8 @@ def _quota_for_account(account: dict[str, Any]) -> dict[str, Any]:
         "placeable": None,
         "full": False,
         "error": None,
+        "auth_state": accounts_store.auth_state(account),
+        "auth_error": account.get("auth_error"),
     }
     try:
         quota = get_provider(account).quota()
@@ -56,6 +60,11 @@ def _quota_for_account(account: dict[str, Any]) -> dict[str, Any]:
             row["available"] = max(0, total - used)
             row["placeable"] = headroom_bytes(used, total)
             row["full"] = is_full(used, total)
+    except AccountAuthError as exc:
+        # Credentials are dead: renewal already flagged the account for reconnect.
+        row["error"] = str(exc)
+        row["auth_state"] = "expired"
+        row["auth_error"] = str(exc)
     except Exception as exc:
         row["error"] = str(exc)
     return row
@@ -119,6 +128,23 @@ def list_storage(request: Request) -> dict[str, Any]:
             "complete": total_known == len(rows) and len(rows) > 0,
             "account_count": len(rows),
         },
+    }
+
+
+@router.post("/renew")
+def renew_accounts(request: Request) -> dict[str, Any]:
+    """Renew provider OAuth tokens now, including accounts flagged for reconnect.
+
+    The background sweep does this on a timer; this is the manual retry the UI
+    offers after the user re-consents.
+    """
+    master_key = require_unlocked(request)
+    user_id = auth_context.require_user_id()
+    rows = token_renewal.renew_user_accounts(user_id, master_key, force=True)
+    return {
+        "accounts": rows,
+        "renewed": sum(1 for row in rows if row["renewed"]),
+        "expired": sum(1 for row in rows if row["state"] == "expired"),
     }
 
 

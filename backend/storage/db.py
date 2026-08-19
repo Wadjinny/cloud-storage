@@ -29,7 +29,7 @@ def escape_like(value: str) -> str:
     )
 
 # Bump when adding a migration. Fresh installs still run migrations (idempotent).
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -55,6 +55,9 @@ CREATE TABLE IF NOT EXISTS accounts (
   label TEXT NOT NULL,
   credentials_enc TEXT NOT NULL,
   enabled INTEGER NOT NULL DEFAULT 1,
+  auth_state TEXT NOT NULL DEFAULT 'ok',
+  auth_error TEXT,
+  auth_renewed_at INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   UNIQUE (user_id, provider, label)
@@ -360,12 +363,23 @@ def _migrate_v6_activity_events(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migrate_v7_account_auth_state(conn: sqlite3.Connection) -> None:
+    """Track OAuth credential health so a dead refresh token reads as 'reconnect'."""
+    _add_column_if_missing(conn, "accounts", "auth_state", "TEXT NOT NULL DEFAULT 'ok'")
+    _add_column_if_missing(conn, "accounts", "auth_error", "TEXT")
+    _add_column_if_missing(conn, "accounts", "auth_renewed_at", "INTEGER")
+    conn.execute(
+        "UPDATE accounts SET auth_state = 'ok' WHERE auth_state IS NULL OR auth_state = ''"
+    )
+
+
 MIGRATIONS: dict[int, Callable[[sqlite3.Connection], None]] = {
     2: _migrate_v2_timestamps,
     3: _migrate_v3_thumbnails,
     4: _migrate_v4_account_enabled,
     5: _migrate_v5_folder_remotes,
     6: _migrate_v6_activity_events,
+    7: _migrate_v7_account_auth_state,
 }
 
 

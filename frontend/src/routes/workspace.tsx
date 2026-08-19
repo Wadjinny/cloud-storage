@@ -24,6 +24,7 @@ import {
   evacuateAccount,
   getStorageStats,
   listAccounts,
+  renewAccounts,
   runHealthCheck,
   setAccountEnabled,
   startGoogleOAuth,
@@ -406,7 +407,6 @@ export default function Workspace() {
   const [megaOpen, setMegaOpen] = useState(false)
   const [megaEmail, setMegaEmail] = useState('')
   const [megaPassword, setMegaPassword] = useState('')
-  const [megaMfa, setMegaMfa] = useState('')
   const [username, setUsername] = useState('')
   const [passphrase, setPassphrase] = useState('')
   const [mkdirOpen, setMkdirOpen] = useState(false)
@@ -674,7 +674,8 @@ export default function Workspace() {
   })
 
   useEffect(() => {
-    if (searchParams.get('connected') === 'gdrive') {
+    const connected = searchParams.get('connected')
+    if (connected === 'gdrive' || connected === 'gdrive-reconnected') {
       void qc.invalidateQueries({ queryKey: ['accounts'] })
       void qc.invalidateQueries({ queryKey: ['vault', 'status'] })
       setSearchParams({}, { replace: true })
@@ -731,15 +732,29 @@ export default function Workspace() {
   })
 
   const megaMut = useMutation({
-    mutationFn: () => connectMega(megaEmail, megaPassword, megaMfa),
+    mutationFn: () => connectMega(megaEmail, megaPassword),
     onSuccess: async () => {
       setMegaOpen(false)
       setMegaEmail('')
       setMegaPassword('')
-      setMegaMfa('')
       setError(null)
       await qc.invalidateQueries({ queryKey: ['accounts'] })
       await qc.invalidateQueries({ queryKey: ['vault', 'status'] })
+    },
+    onError: (e: Error) => setError(e.message),
+  })
+
+  const renewMut = useMutation({
+    mutationFn: renewAccounts,
+    onSuccess: async (result) => {
+      // Accounts Google still rejects stay flagged; the card offers Reconnect.
+      setError(
+        result.expired > 0
+          ? `${result.expired} account(s) need to be reconnected`
+          : null,
+      )
+      await qc.invalidateQueries({ queryKey: ['accounts'] })
+      await qc.invalidateQueries({ queryKey: ['accounts', 'storage'] })
     },
     onError: (e: Error) => setError(e.message),
   })
@@ -1937,7 +1952,7 @@ export default function Workspace() {
                   <AccountsIcon />
                   Accounts
                 </div>
-                <div className="panel-header-actions">
+                <div className="panel-header-actions accounts-header-actions">
                   <button
                     type="button"
                     className={`btn-micro${accountsManage ? ' active' : ''}`}
@@ -1977,6 +1992,19 @@ export default function Workspace() {
                         onClick={() => pruneAnalyzeMut.mutate()}
                       >
                         Prune
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-micro"
+                        disabled={
+                          accountsOpBusy ||
+                          renewMut.isPending ||
+                          !accountsQuery.data?.length
+                        }
+                        title="Refresh provider access tokens now (runs automatically too)"
+                        onClick={() => renewMut.mutate()}
+                      >
+                        {renewMut.isPending ? 'Renewing…' : 'Renew'}
                       </button>
                       <button
                         type="button"
@@ -2029,6 +2057,11 @@ export default function Workspace() {
                               ? pct
                               : null
                         const uploadEnabled = account.enabled !== false
+                        // Storage rows learn about a dead grant first (they call the provider).
+                        const needsReauth =
+                          (account.auth_state ?? 'ok') !== 'ok' ||
+                          (stats?.auth_state ?? 'ok') !== 'ok'
+                        const authError = account.auth_error ?? stats?.auth_error ?? null
                         const uploadRow =
                           transfer?.kind === 'upload' || transfer?.kind === 'download'
                             ? transfer.byAccount?.find((a) => a.account_id === account.id)
@@ -2039,7 +2072,9 @@ export default function Workspace() {
                         return (
                           <div
                             key={account.id}
-                            className={`account-card${uploadEnabled ? '' : ' is-disabled'}`}
+                            className={`account-card${uploadEnabled ? '' : ' is-disabled'}${
+                              needsReauth ? ' needs-reauth' : ''
+                            }`}
                           >
                             <div className="list-row">
                               <span className={`provider-swatch ${account.provider}`} />
@@ -2049,6 +2084,7 @@ export default function Workspace() {
                               <span className="list-row-meta">
                                 {account.provider}
                                 {uploadEnabled ? '' : ' · off'}
+                                {needsReauth ? ' · expired' : ''}
                               </span>
                               {accountsManage ? (
                                 <>
@@ -2082,10 +2118,35 @@ export default function Workspace() {
                                 </>
                               ) : null}
                             </div>
+                            {needsReauth ? (
+                              <div className="account-reauth">
+                                <span
+                                  className="account-reauth-msg"
+                                  title={authError ?? undefined}
+                                >
+                                  Token expired · no new uploads until reconnected
+                                </span>
+                                {account.provider === 'gdrive' ? (
+                                  <button
+                                    type="button"
+                                    className="btn-micro"
+                                    disabled={accountsOpBusy}
+                                    title={
+                                      accountsOpBusy
+                                        ? 'Finish the current operation before reconnecting'
+                                        : 'Re-authorize this account with Google'
+                                    }
+                                    onClick={() => startGoogleOAuth(account.id)}
+                                  >
+                                    Reconnect
+                                  </button>
+                                ) : null}
+                              </div>
+                            ) : null}
                             <div className="storage-stats">
                               {storageQuery.isLoading && !stats ? (
                                 <span className="storage-meta">Loading quota…</span>
-                              ) : stats?.error ? (
+                              ) : needsReauth ? null : stats?.error ? (
                                 <span className="storage-meta storage-error" title={stats.error}>
                                   Quota unavailable
                                 </span>
@@ -2996,22 +3057,10 @@ export default function Workspace() {
                   autoComplete="current-password"
                 />
               </div>
-              <div>
-                <div className="field-label">2FA code (if enabled)</div>
-                <input
-                  className="input"
-                  type="text"
-                  inputMode="numeric"
-                  autoComplete="one-time-code"
-                  placeholder="6-digit code"
-                  value={megaMfa}
-                  onChange={(e) => setMegaMfa(e.target.value)}
-                />
-              </div>
               <div style={{ fontSize: 11, color: 'var(--text-faint)' }}>
-                Use your MEGA email/password (not Google SSO alone). If you only
-                use “Continue with Google” on mega.nz, set a password under
-                Account → Security first.
+                Password-only MEGA accounts. Authenticator / 2FA is not supported.
+                If you only use “Continue with Google” on mega.nz, set a password
+                under Account → Security first.
               </div>
             </div>
             <div className="modal-actions">

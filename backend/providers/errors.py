@@ -34,6 +34,15 @@ class ProviderError(RuntimeError):
         return meta
 
 
+class AccountAuthError(ProviderError):
+    """Stored provider credentials are dead; only reconnecting the account fixes it.
+
+    Raised when Google answers a token refresh with ``invalid_grant`` (refresh
+    token expired, revoked, or invalidated), so callers can show a Reconnect
+    action instead of a raw OAuth payload.
+    """
+
+
 def provider_error_from_download(exc: BaseException, account: dict[str, Any]) -> ProviderError:
     """Map a raw provider download exception into a clear, account-tagged error."""
     if isinstance(exc, ProviderError):

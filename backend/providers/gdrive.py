@@ -5,7 +5,7 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httplib2
@@ -27,6 +27,7 @@ from config import (
     PROVIDER_OP_TIMEOUT,
     SHARD_FOLDER_NAME,
 )
+from providers.errors import AccountAuthError
 from providers.retry import call_with_retries
 from storage import accounts as accounts_store
 
@@ -60,6 +61,133 @@ def _parse_expiry(raw: Any) -> datetime | None:
     return exp
 
 
+TOKEN_URI = "https://oauth2.googleapis.com/token"
+
+
+def build_credentials(credentials: dict[str, Any]) -> Credentials:
+    """google-auth credentials from a stored dict (empty strings would look valid)."""
+    return Credentials(
+        token=credentials.get("token") or None,
+        refresh_token=credentials.get("refresh_token") or None,
+        token_uri=TOKEN_URI,
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        scopes=GOOGLE_SCOPES,
+        expiry=_parse_expiry(credentials.get("expiry")),
+    )
+
+
+def _credentials_payload(creds: Credentials, *, refresh_token: str | None) -> dict[str, Any]:
+    """Storable credential dict; expiry normalised to naive UTC like _parse_expiry."""
+    expiry = creds.expiry
+    if expiry is not None and expiry.tzinfo is not None:
+        expiry = expiry.astimezone(timezone.utc).replace(tzinfo=None)
+    return {
+        "token": creds.token,
+        "refresh_token": creds.refresh_token or refresh_token,
+        "expiry": expiry.isoformat() if expiry is not None else None,
+    }
+
+
+def credentials_expire_within(credentials: dict[str, Any], seconds: int) -> bool:
+    """True when the stored access token is missing, undated, or expiring soon."""
+    if not (credentials.get("refresh_token") or ""):
+        return False
+    if not (credentials.get("token") or ""):
+        return True
+    expiry = _parse_expiry(credentials.get("expiry"))
+    if expiry is None:
+        return True
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    return expiry <= now + timedelta(seconds=max(0, seconds))
+
+
+def _is_invalid_grant(exc: BaseException) -> bool:
+    """Google rejected the refresh token itself (expired, revoked, or reused)."""
+    return "invalid_grant" in str(exc).lower()
+
+
+def _auth_error(
+    exc: BaseException,
+    *,
+    account_id: str | None,
+    label: str | None,
+    user_id: str | None = None,
+) -> AccountAuthError | None:
+    """Flag the account and build a reconnect error, or None for transient failures."""
+    if not _is_invalid_grant(exc):
+        return None
+    who = label or account_id or "unknown"
+    message = (
+        f"Google Drive account {who} must be reconnected: "
+        "Google rejected the saved token (expired or revoked)"
+    )
+    if account_id:
+        try:
+            accounts_store.mark_auth_expired(account_id, message, user_id=user_id)
+        except Exception:
+            # Flagging is best effort; the caller still gets the clear error.
+            log.warning("could not flag expired credentials account=%s", account_id, exc_info=True)
+    return AccountAuthError(
+        message,
+        provider="gdrive",
+        account_id=account_id,
+        account_label=label,
+        status_code=401,
+    )
+
+
+def renew_credentials(
+    account: dict[str, Any],
+    *,
+    user_id: str | None = None,
+    master_key: bytes | None = None,
+) -> dict[str, Any]:
+    """Refresh one account's access token now, persist it, and return the new dict.
+
+    Raises ``AccountAuthError`` (and flags the account) when Google rejects the
+    stored refresh token; transient refresh failures propagate unchanged.
+    """
+    account_id = account.get("id")
+    label = str(account.get("label") or "") or None
+    credentials = account.get("credentials") or {}
+    stored_refresh = credentials.get("refresh_token") or None
+    if not stored_refresh:
+        message = (
+            f"Google Drive account {label or account_id or 'unknown'} must be reconnected: "
+            "no refresh token stored"
+        )
+        if account_id:
+            accounts_store.mark_auth_expired(account_id, message, user_id=user_id)
+        raise AccountAuthError(
+            message,
+            provider="gdrive",
+            account_id=account_id,
+            account_label=label,
+            status_code=401,
+        )
+
+    creds = build_credentials(credentials)
+    try:
+        creds.refresh(Request())
+    except Exception as exc:
+        auth_error = _auth_error(exc, account_id=account_id, label=label, user_id=user_id)
+        if auth_error is not None:
+            raise auth_error from exc
+        raise
+
+    payload = _credentials_payload(creds, refresh_token=stored_refresh)
+    if account_id:
+        accounts_store.update_credentials(
+            account_id,
+            payload,
+            user_id=user_id,
+            master_key=master_key,
+        )
+        accounts_store.mark_auth_ok(account_id, user_id=user_id)
+    return payload
+
+
 class GDriveProvider:
     """Drive provider with a per-thread API client so shard ops can run in parallel.
 
@@ -75,22 +203,16 @@ class GDriveProvider:
         account_id: str | None = None,
         user_id: str | None = None,
         master_key: bytes | None = None,
+        label: str | None = None,
     ) -> None:
         # Empty string tokens break google-auth (treated as present but invalid).
         self._account_id = account_id
         self._user_id = user_id
         self._master_key = master_key
+        self._label = label
         self._refresh_token = credentials.get("refresh_token") or None
         self._creds_lock = threading.Lock()
-        self._creds = Credentials(
-            token=credentials.get("token") or None,
-            refresh_token=self._refresh_token,
-            token_uri="https://oauth2.googleapis.com/token",
-            client_id=GOOGLE_CLIENT_ID,
-            client_secret=GOOGLE_CLIENT_SECRET,
-            scopes=GOOGLE_SCOPES,
-            expiry=_parse_expiry(credentials.get("expiry")),
-        )
+        self._creds = build_credentials(credentials)
         self._persisted_token = self._creds.token
         self._local = threading.local()
         self._folder_id: str | None = None
@@ -108,16 +230,9 @@ class GDriveProvider:
         token = self._creds.token
         if token == self._persisted_token and self._creds.expiry is not None:
             return
-        expiry = self._creds.expiry
-        if expiry is not None and expiry.tzinfo is not None:
-            expiry = expiry.astimezone(timezone.utc).replace(tzinfo=None)
         accounts_store.update_credentials(
             self._account_id,
-            {
-                "token": token,
-                "refresh_token": self._creds.refresh_token or self._refresh_token,
-                "expiry": expiry.isoformat() if expiry is not None else None,
-            },
+            _credentials_payload(self._creds, refresh_token=self._refresh_token),
             user_id=self._user_id,
             master_key=self._master_key,
         )
@@ -133,9 +248,32 @@ class GDriveProvider:
             )
             if needs_refresh:
                 log.info("gdrive refreshing access token (proactive)")
-                creds.refresh(Request())
+                try:
+                    creds.refresh(Request())
+                except Exception as exc:
+                    raise self._refresh_failure(exc) from exc
                 self._persist_credentials()
+                self._mark_auth_ok()
             return creds
+
+    def _refresh_failure(self, exc: BaseException) -> BaseException:
+        """Map a refresh failure to a reconnect error when the grant itself is dead."""
+        auth_error = _auth_error(
+            exc,
+            account_id=self._account_id,
+            label=self._label,
+            user_id=self._user_id,
+        )
+        return auth_error if auth_error is not None else exc
+
+    def _mark_auth_ok(self) -> None:
+        """Clear a stale reconnect flag once Google hands out a fresh token again."""
+        if not self._account_id:
+            return
+        try:
+            accounts_store.mark_auth_ok(self._account_id, user_id=self._user_id)
+        except Exception:
+            log.debug("could not clear auth flag account=%s", self._account_id, exc_info=True)
 
     def _thread_credentials(self) -> Credentials:
         return self._ensure_fresh_credentials()
@@ -272,6 +410,13 @@ class GDriveProvider:
             raise TimeoutError(
                 f"Google Drive operation timed out after {PROVIDER_OP_TIMEOUT}s"
             ) from exc
+        except Exception as exc:
+            # AuthorizedHttp refreshes on a 401 by itself; surface a dead grant clearly.
+            mapped = self._refresh_failure(exc)
+            if mapped is not exc:
+                self._drop_thread_service()
+                raise mapped from exc
+            raise
         # Persist if AuthorizedHttp refreshed after a rare 401.
         with self._creds_lock:
             self._persist_credentials()

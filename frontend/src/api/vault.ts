@@ -3,7 +3,7 @@ import {
   supportsDownloadFolder,
   writeToDownloadFolder,
 } from '../downloadFolder'
-import { apiUrl } from './base'
+import { apiUrl, readError } from './base'
 
 export type VaultStatus = {
   unlocked: boolean
@@ -138,16 +138,6 @@ export type ProgressUpdate = {
   zipArcname?: string
   /** Arcnames downloading ahead of the file currently written into the zip. */
   zipPrefetching?: string[]
-}
-
-async function readError(res: Response): Promise<string> {
-  try {
-    const data = (await res.json()) as { detail?: string }
-    if (typeof data.detail === 'string') return data.detail
-  } catch {
-    /* ignore */
-  }
-  return res.statusText || 'Request failed'
 }
 
 export async function getVaultStatus(): Promise<VaultStatus> {

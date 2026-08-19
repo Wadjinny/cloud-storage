@@ -11,6 +11,7 @@ from routes.auth import router as auth_router
 from routes.auth_google import router as auth_google_router
 from routes.auth_mega import router as auth_mega_router
 from routes.vault import router as vault_router
+from services import token_renewal
 from storage.db import init_db
 from storage.users import ensure_init_user
 
@@ -19,7 +20,11 @@ from storage.users import ensure_init_user
 async def lifespan(_app: FastAPI):
     init_db()
     ensure_init_user()
-    yield
+    token_renewal.start()
+    try:
+        yield
+    finally:
+        await token_renewal.stop()
 
 
 app = FastAPI(title="cloud-storage", lifespan=lifespan)

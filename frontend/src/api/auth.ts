@@ -1,14 +1,4 @@
-import { apiUrl } from './base'
-
-async function readError(res: Response): Promise<string> {
-  try {
-    const data = (await res.json()) as { detail?: string }
-    if (typeof data.detail === 'string') return data.detail
-  } catch {
-    /* ignore */
-  }
-  return res.statusText || 'Request failed'
-}
+import { apiUrl, readError } from './base'
 
 export async function login(username: string, passphrase: string): Promise<void> {
   const res = await fetch(apiUrl('/api/auth/login'), {

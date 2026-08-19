@@ -7,12 +7,19 @@ import {
   type TransferJob,
 } from './vault'
 
+/** 'expired': the provider rejected the stored grant; only a reconnect fixes it. */
+export type AuthState = 'ok' | 'expired'
+
 export type Account = {
   id: string
   provider: 'gdrive' | 'mega'
   label: string
   /** When false, account is skipped for new upload placement. */
   enabled?: boolean
+  auth_state?: AuthState
+  auth_error?: string | null
+  /** Unix seconds of the last successful token renewal / connect. */
+  auth_renewed_at?: number | null
 }
 
 export type AccountStorage = {
@@ -28,6 +35,8 @@ export type AccountStorage = {
   vault_used?: number
   full: boolean
   error: string | null
+  auth_state?: AuthState
+  auth_error?: string | null
 }
 
 export type StorageStats = {
@@ -151,7 +160,13 @@ export class AccountInUseError extends Error {
 
 async function readError(res: Response): Promise<string> {
   try {
-    const data = (await res.json()) as { detail?: string | AccountInUseDetail }
+    const data = (await res.json()) as {
+      detail?: string | AccountInUseDetail
+      error?: { message?: unknown }
+    }
+    if (typeof data.error?.message === 'string' && data.error.message) {
+      return data.error.message
+    }
     if (typeof data.detail === 'string') return data.detail
     if (
       data.detail &&
@@ -168,7 +183,23 @@ async function readError(res: Response): Promise<string> {
 
 async function readDeleteAccountError(res: Response): Promise<Error> {
   try {
-    const data = (await res.json()) as { detail?: string | AccountInUseDetail }
+    const data = (await res.json()) as {
+      detail?: string | AccountInUseDetail
+      error?: { code?: unknown; message?: unknown } & Partial<AccountInUseDetail>
+    }
+    if (data.error && data.error.code === 'account_in_use') {
+      return new AccountInUseError({
+        code: 'account_in_use',
+        message: String(data.error.message ?? data.detail ?? 'Account in use'),
+        account_id: String(data.error.account_id ?? ''),
+        label: data.error.label,
+        provider: data.error.provider,
+        shard_count: Number(data.error.shard_count ?? 0),
+        file_count: Number(data.error.file_count ?? 0),
+        thumb_count: Number(data.error.thumb_count ?? 0),
+        sample_paths: data.error.sample_paths ?? [],
+      })
+    }
     if (
       data.detail &&
       typeof data.detail === 'object' &&
@@ -333,25 +364,47 @@ export async function applyPrune(
   return result
 }
 
-export async function connectMega(
-  email: string,
-  password: string,
-  mfa?: string,
-): Promise<Account> {
+export async function connectMega(email: string, password: string): Promise<Account> {
   const res = await fetch(apiUrl('/api/auth/mega'), {
     method: 'POST',
     credentials: 'include',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      email,
-      password,
-      ...(mfa?.trim() ? { mfa: mfa.trim() } : {}),
-    }),
+    body: JSON.stringify({ email, password }),
   })
   if (!res.ok) throw new Error(await readError(res))
   return res.json() as Promise<Account>
 }
 
-export function startGoogleOAuth(): void {
-  window.location.href = apiUrl('/api/auth/google/start')
+export type RenewAccountRow = {
+  account_id: string
+  label: string | null
+  provider: string
+  /** 'renewed' | 'fresh' | 'expired' | 'error' */
+  state: string
+  renewed: boolean
+  error: string | null
+}
+
+export type RenewResult = {
+  accounts: RenewAccountRow[]
+  renewed: number
+  expired: number
+}
+
+/** Refresh provider OAuth tokens now (the backend also sweeps on a timer). */
+export async function renewAccounts(): Promise<RenewResult> {
+  const res = await fetch(apiUrl('/api/accounts/renew'), {
+    method: 'POST',
+    credentials: 'include',
+  })
+  if (!res.ok) throw new Error(await readError(res))
+  return res.json() as Promise<RenewResult>
+}
+
+/** Pass an account id to re-consent that account instead of connecting a new one. */
+export function startGoogleOAuth(accountId?: string): void {
+  const path = accountId
+    ? `/api/auth/google/start?account_id=${encodeURIComponent(accountId)}`
+    : '/api/auth/google/start'
+  window.location.href = apiUrl(path)
 }

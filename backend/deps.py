@@ -3,6 +3,7 @@ from __future__ import annotations
 from fastapi import HTTPException, Request
 
 from services import crypto
+from services import session_keys
 from services.account_lock import accounts_manage_blocked_reason
 from storage import auth_context
 
@@ -19,6 +20,8 @@ def require_unlocked(request: Request) -> bytes:
     except Exception as exc:
         raise HTTPException(status_code=401, detail="Vault is locked") from exc
     auth_context.set_auth(str(user_id), master_key)
+    # Keep the key available to the background token renewal sweep.
+    session_keys.remember(str(user_id), master_key)
     return master_key
 
 

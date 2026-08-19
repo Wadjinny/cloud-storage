@@ -19,6 +19,7 @@ def get_provider(
             account_id=account.get("id"),
             user_id=account.get("user_id") or auth_context.get_user_id(),
             master_key=auth_context.get_master_key(),
+            label=account.get("label"),
         )
     if provider == "mega":
         return MegaProvider(credentials)

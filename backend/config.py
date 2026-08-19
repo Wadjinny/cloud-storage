@@ -134,6 +134,25 @@ VIDEO_PREVIEW_MAX_MB = float(os.environ.get("VIDEO_PREVIEW_MAX_MB", "100"))
 VIDEO_PREVIEW_MAX_BYTES = max(0, int(VIDEO_PREVIEW_MAX_MB * 1024 * 1024))
 # How long to keep activity history rows (days). Default 30 (one month).
 HISTORY_RETENTION_DAYS = max(1, int(os.environ.get("HISTORY_RETENTION_DAYS", "30")))
+# Background OAuth renewal: refresh Google access tokens before they expire so
+# saved refresh tokens keep being used (Google expires idle grants) and jobs do
+# not start with a stale token.
+TOKEN_RENEWAL_ENABLED = os.environ.get("TOKEN_RENEWAL_ENABLED", "1").strip().lower() not in (
+    "0",
+    "false",
+    "no",
+)
+# Sweep period for the renewal loop (seconds).
+TOKEN_RENEWAL_INTERVAL_SECONDS = max(
+    30, int(os.environ.get("TOKEN_RENEWAL_INTERVAL_SECONDS", "600"))
+)
+# Renew when the access token expires within this window (or has no known expiry).
+TOKEN_RENEWAL_SKEW_SECONDS = max(60, int(os.environ.get("TOKEN_RENEWAL_SKEW_SECONDS", "900")))
+# How long an unlocked user's master key stays available in memory for background
+# renewal after their last authenticated request (seconds; 0 disables the sweep).
+TOKEN_RENEWAL_SESSION_TTL = max(
+    0, int(os.environ.get("TOKEN_RENEWAL_SESSION_TTL", str(24 * 3600)))
+)
 GOOGLE_SCOPES = [
     "https://www.googleapis.com/auth/drive.file",
     "https://www.googleapis.com/auth/userinfo.email",

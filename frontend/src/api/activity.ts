@@ -1,4 +1,4 @@
-import { apiUrl } from './base'
+import { apiUrl, readError } from './base'
 
 export type ActivityStatus = 'success' | 'error' | 'cancelled'
 
@@ -45,16 +45,6 @@ export type ActivityFilters = {
   until?: number
   action?: string
   status?: string
-}
-
-async function readError(res: Response): Promise<string> {
-  try {
-    const data = (await res.json()) as { detail?: string }
-    if (typeof data.detail === 'string') return data.detail
-  } catch {
-    /* ignore */
-  }
-  return res.statusText || 'Request failed'
 }
 
 function toParams(opts?: ActivityFilters): URLSearchParams {
