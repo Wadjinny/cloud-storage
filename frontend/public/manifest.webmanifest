@@ -1,12 +1,12 @@
 {
-  "name": "Template Website",
-  "short_name": "Website",
-  "description": "Example app built with React, Vite, Tailwind CSS, and React Router.",
+  "name": "Cloud Storage",
+  "short_name": "Cloud Storage",
+  "description": "Encrypted, sharded personal vault across Google Drive and MEGA.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
-  "background_color": "#0f172a",
-  "theme_color": "#0f172a",
+  "background_color": "#1e1e1e",
+  "theme_color": "#1e1e1e",
   "icons": [
     {
       "src": "/android-chrome-192x192.png",
