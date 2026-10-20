@@ -1,4 +1,4 @@
-cloud-storage.w-ilyas.site {
+cloud-storage.w-ilyas.ink, cloud-storage.w-ilyas.site {
 	encode gzip
 	handle /api/* {
 		reverse_proxy localhost:1234
